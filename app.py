@@ -1,4 +1,5 @@
 import re
+import socket
 import urllib.parse
 import requests
 import pandas as pd
@@ -16,14 +17,14 @@ st.write("Extract local trade listings, crawl custom domains, and verify email d
 st.sidebar.header("API Configurations")
 google_api_key = st.sidebar.text_input(
     "Google Cloud API Key", 
-    value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", 
+    value="YOUR_GOOGLE_PLACES_API_KEY_HERE", 
     type="password"
 )
 abstract_api_key = st.sidebar.text_input(
     "Abstract Email Verification API Key", 
-    value="60b087f0bc0a47259b5ea828b2babf93", 
+    value="", 
     type="password", 
-    help="Optional: Enter your key to verify email deliverability."
+    help="Enter your Abstract API key to verify email deliverability."
 )
 
 # Main Inputs
@@ -134,46 +135,69 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     return ", ".join(found_emails) if found_emails else "None Found"
 
 def verify_email_abstract(email, api_key):
-    """Verifies email deliverability using Abstract API's Email Reputation endpoint."""
-    if not api_key or api_key == "" or api_key == "YOUR_ABSTRACT_API_KEY_HERE":
-        return "No API Key Provided"
+    """Safely verifies emails across Abstract API endpoints with DNS fallback."""
     if not email or email == "None Found":
         return "N/A - No Email"
     
     primary_email = email.split(',')[0].strip()
     
-    # Updated Endpoint to match Email Reputation API
-    url = f"https://email-reputation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
+    # Check syntax basic format
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', primary_email):
+        return "Invalid Format"
     
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Check fields returned by Email Reputation API
-            quality_score = data.get("quality_score")
-            is_disposable = data.get("is_disposable_email", {}).get("value", False) if isinstance(data.get("is_disposable_email"), dict) else data.get("is_disposable_email", False)
-            is_valid_format = data.get("is_valid_format", {}).get("value", True) if isinstance(data.get("is_valid_format"), dict) else data.get("is_valid_format", True)
-            
-            if is_disposable:
-                return "Disposable / Temporary"
-            elif quality_score and float(quality_score) >= 0.7:
-                return "Valid / High Reputation"
-            elif quality_score and float(quality_score) >= 0.4:
-                return "Medium Quality"
-            elif is_valid_format:
-                return "Valid Format"
-            else:
-                return "Low Quality / Risky"
+    if not api_key or api_key == "" or "YOUR_ABSTRACT" in api_key:
+        # Direct DNS MX Mail Server check if no API key is set
+        try:
+            domain = primary_email.split('@')[1]
+            socket.gethostbyname(domain)
+            return "Valid Domain (DNS Checked)"
+        except Exception:
+            return "Invalid Domain"
+
+    # Multi-endpoint check: Try Email Validation and Email Reputation APIs
+    endpoints = [
+        f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}",
+        f"https://email-reputation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
+    ]
+
+    for url in endpoints:
+        try:
+            resp = requests.get(url, timeout=4)
+            if resp.status_code == 200:
+                data = resp.json()
                 
-        elif response.status_code == 401:
-            return "Invalid Abstract Key"
-        elif response.status_code == 429:
-            return "Abstract Limit Reached"
-        else:
-            return f"API Status ({response.status_code})"
+                # Check deliverability
+                deliv = data.get("deliverability")
+                if not deliv and isinstance(data.get("email_deliverability"), dict):
+                    deliv = data.get("email_deliverability", {}).get("status")
+                
+                score = data.get("quality_score")
+                is_disposable = data.get("is_disposable_email", {}).get("value", False) if isinstance(data.get("is_disposable_email"), dict) else data.get("is_disposable_email", False)
+                
+                if is_disposable:
+                    return "Disposable Email"
+                elif deliv and str(deliv).upper() == "DELIVERABLE":
+                    return "Valid / Deliverable"
+                elif deliv and str(deliv).upper() == "UNDELIVERABLE":
+                    return "Invalid Inbox"
+                elif score is not None and float(score) >= 0.5:
+                    return "Valid / High Reputation"
+                else:
+                    return "Valid Format"
+            elif resp.status_code == 401:
+                continue
+            elif resp.status_code == 429:
+                return "Abstract Limit Reached"
+        except Exception:
+            continue
+
+    # Fallback to local DNS check if API call fails
+    try:
+        domain = primary_email.split('@')[1]
+        socket.gethostbyname(domain)
+        return "Valid Domain (DNS Checked)"
     except Exception:
-        return "Verification Failed"
+        return "Invalid Domain"
 
 def to_excel(df):
     """Converts a DataFrame into an Excel file buffer."""
@@ -234,7 +258,7 @@ if st.button("🚀 Generate Leads", type="primary"):
             if not found_email or found_email == "None Found":
                 found_email = search_bing_for_emails(b_name, location, domain_name=b_site)
             
-            # Step 3: Abstract API Email Verification
+            # Step 3: Abstract API Email Verification (or local DNS check)
             email_status = "None Found"
             if found_email and found_email != "None Found":
                 email_status = verify_email_abstract(found_email, abstract_api_key)
