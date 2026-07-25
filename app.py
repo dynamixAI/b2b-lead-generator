@@ -14,7 +14,7 @@ st.write("Extract local trade listings and deep-crawl for direct email contacts.
 
 # Sidebar Configuration
 st.sidebar.header("Settings")
-api_key_input = st.sidebar.text_input("Google Cloud API Key", value="YOUR_GOOGLE_PLACES_API_KEY_HERE", type="password")
+api_key_input = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
 
 # Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
