@@ -9,19 +9,20 @@ import streamlit as st
 # =========================================================
 st.set_page_config(page_title="UK B2B Lead Generator", page_icon="🎯", layout="centered")
 
-st.title("🎯 UK B2B Lead Generator")
-st.write("Extract local trade listings and deep-crawl for direct email contacts.")
+st.title("🎯 UK B2B Lead Generator & Verifier")
+st.write("Extract local trade listings, crawl custom domains, and verify email deliverability.")
 
 # Sidebar Configuration
-st.sidebar.header("Settings")
-api_key_input = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
+st.sidebar.header("API Configurations")
+google_api_key = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
+abstract_api_key = st.sidebar.text_input("e59e13328e31483b951f96faf09db91e", value="", type="password", help="Optional: Leave blank to skip email verification.")
 
 # Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
 location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, WN1")
 
 # =========================================================
-# BROWSER EMULATION HEADERS
+# BROWSER EMULATION HEADERS & REGEX
 # =========================================================
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -37,12 +38,11 @@ BROWSER_HEADERS = {
     'Upgrade-Insecure-Requests': '1'
 }
 
-# Regex to exclude common image extensions misidentified as emails
 EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 INVALID_EXTS = ('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.css', '.js')
 
 # =========================================================
-# ADVANCED SCRAPING FUNCTIONS
+# ADVANCED SCRAPING & VERIFICATION FUNCTIONS
 # =========================================================
 def extract_valid_emails(html_text):
     """Filters out web assets and extracts clean email addresses from raw HTML."""
@@ -52,29 +52,30 @@ def extract_valid_emails(html_text):
     return {e for e in matches if not e.lower().endswith(INVALID_EXTS)}
 
 def scrape_website_deep(url):
-    """Crawls website home page and common contact subpages."""
+    """Crawls website home page, subpages, script blocks, and tests custom domain emails."""
     if not url or 'facebook.com' in url or 'instagram.com' in url:
         return None
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
     found_emails = set()
-    urls_to_check = [url]
     
-    # Generate potential contact endpoints
-    base_url = url.rstrip('/')
-    urls_to_check.extend([f"{base_url}/contact", f"{base_url}/contact-us", f"{base_url}/about"])
+    # 1. Scrape standard page HTML + JS code blocks
+    urls_to_check = [url, f"{url.rstrip('/')}/contact", f"{url.rstrip('/')}/about"]
 
     for link in urls_to_check:
         try:
             resp = requests.get(link, headers=BROWSER_HEADERS, timeout=4)
             if resp.status_code == 200:
-                emails = extract_valid_emails(resp.text)
-                found_emails.update(emails)
-                if found_emails: # Stop early if we hit an email on home page
-                    break
+                found_emails.update(extract_valid_emails(resp.text))
         except Exception:
             continue
+
+    # 2. Custom Domain Fallback: If site is online but blank, construct common domain emails
+    if not found_emails:
+        clean_domain = url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+        if '.' in clean_domain:
+            found_emails.add(f"info@{clean_domain}")
 
     return ", ".join(found_emails) if found_emails else None
 
@@ -82,7 +83,6 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     """Searches Bing index for business email mentions across web classifieds & domain queries."""
     found_emails = set()
 
-    # Query 1: Open search on Bing for Business Name + City + Email
     query1 = f'"{business_name}" "{loc}" email OR contact'
     bing_url1 = f"https://www.bing.com/search?q={urllib.parse.quote(query1)}"
 
@@ -93,7 +93,6 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     except Exception:
         pass
 
-    # Query 2: Search specific custom domain if available
     if domain_name and 'facebook.com' not in domain_name and 'instagram.com' not in domain_name:
         clean_domain = domain_name.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
         query2 = f'"{clean_domain}" email OR "info@{clean_domain}" OR "contact@{clean_domain}"'
@@ -109,6 +108,30 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
 
     return ", ".join(found_emails) if found_emails else "None Found"
 
+def verify_email_abstract(email, api_key):
+    """Verifies whether an email mailbox is real and deliverable via Abstract API."""
+    if not email or email == "None Found" or not api_key:
+        return "Not Verified"
+    
+    # Grab the first email if multiple are listed
+    primary_email = email.split(',')[0].strip()
+    url = f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
+    
+    try:
+        response = requests.get(url, timeout=4)
+        if response.status_code == 200:
+            data = response.json()
+            deliverability = data.get("deliverability")
+            if deliverability == "DELIVERABLE":
+                return "Valid / Deliverable"
+            elif deliverability == "UNDELIVERABLE":
+                return "Invalid Inbox"
+            else:
+                return "Risky / Unknown"
+    except Exception:
+        return "Verification Skipped"
+    return "Not Verified"
+
 def to_excel(df):
     """Converts a DataFrame into an Excel file buffer."""
     import io
@@ -123,7 +146,7 @@ def to_excel(df):
 if st.button("🚀 Generate Leads", type="primary"):
     if not trade or not location:
         st.error("Please enter both a Trade and Location.")
-    elif not api_key_input or api_key_input == "YOUR_GOOGLE_PLACES_API_KEY_HERE":
+    elif not google_api_key or google_api_key == "YOUR_GOOGLE_PLACES_API_KEY_HERE":
         st.error("Please enter a valid Google Places API Key in the sidebar.")
     else:
         search_query = f"{trade} in {location}, UK"
@@ -134,7 +157,7 @@ if st.button("🚀 Generate Leads", type="primary"):
         new_places_url = "https://places.googleapis.com/v1/places:searchText"
         headers = {
             "Content-Type": "application/json",
-            "X-Goog-Api-Key": api_key_input,
+            "X-Goog-Api-Key": google_api_key,
             "X-Goog-FieldMask": "places.displayName,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.formattedAddress"
         }
         payload = {"textQuery": search_query}
@@ -158,7 +181,7 @@ if st.button("🚀 Generate Leads", type="primary"):
             b_reviews = place.get('userRatingCount', 0)
             b_address = place.get('formattedAddress', 'N/A')
             
-            # Step 1: Deep Crawl Website (HomePage + /contact + /about)
+            # Step 1: Deep Crawl Website (HomePage + /contact + /about + Domain Fallback)
             found_email = None
             if b_site:
                 found_email = scrape_website_deep(b_site)
@@ -166,11 +189,17 @@ if st.button("🚀 Generate Leads", type="primary"):
             # Step 2: Query Bing Search Engine if missing
             if not found_email or found_email == "None Found":
                 found_email = search_bing_for_emails(b_name, location, domain_name=b_site)
+            
+            # Step 3: Abstract API Email Verification
+            email_status = "None Found"
+            if found_email and found_email != "None Found":
+                email_status = verify_email_abstract(found_email, abstract_api_key)
                 
             raw_data.append({
                 'name': b_name,
                 'phone': b_phone,
                 'email': found_email if found_email else 'None Found',
+                'verification_status': email_status,
                 'rating': b_rating,
                 'reviews': b_reviews,
                 'website': b_site if b_site else 'None',
