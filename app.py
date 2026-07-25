@@ -18,12 +18,12 @@ st.write("Extract local trade listings, crawl custom domains, and verify email d
 st.sidebar.header("API Configurations")
 google_api_key = st.sidebar.text_input(
     "Google Cloud API Key", 
-    value="YOUR_GOOGLE_PLACES_API_KEY_HERE", 
+    value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", 
     type="password"
 )
 abstract_api_key = st.sidebar.text_input(
     "Abstract Email Verification API Key", 
-    value="", 
+    value="e59e13328e31483b951f96faf09db91e", 
     type="password", 
     help="Enter your Abstract API key to verify email deliverability."
 )
