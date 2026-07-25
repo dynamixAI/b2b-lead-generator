@@ -14,12 +14,21 @@ st.write("Extract local trade listings, crawl custom domains, and verify email d
 
 # Sidebar Configuration
 st.sidebar.header("API Configurations")
-google_api_key = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
-abstract_api_key = st.sidebar.text_input("Abstract Email Verification API Key", value="e59e13328e31483b951f96faf09db91e", type="password", help="Optional: Leave blank to skip email verification.")
+google_api_key = st.sidebar.text_input(
+    "Google Cloud API Key", 
+    value="YOUR_GOOGLE_PLACES_API_KEY_HERE", 
+    type="password"
+)
+abstract_api_key = st.sidebar.text_input(
+    "Abstract Email Verification API Key", 
+    value="", 
+    type="password", 
+    help="Optional: Enter your key to verify email deliverability."
+)
 
 # Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
-location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, WN1")
+location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, Oxford")
 
 # =========================================================
 # BROWSER EMULATION HEADERS & REGEX
@@ -51,33 +60,49 @@ def extract_valid_emails(html_text):
     matches = set(re.findall(EMAIL_REGEX, html_text))
     return {e for e in matches if not e.lower().endswith(INVALID_EXTS)}
 
+def is_holding_page(html_text):
+    """Detects standard blank or under-construction landing pages."""
+    if not html_text:
+        return True
+    holding_phrases = [
+        "under construction", 
+        "coming soon", 
+        "check back soon", 
+        "domain for sale", 
+        "website under maintenance",
+        "parked domain"
+    ]
+    text_lower = html_text.lower()
+    return any(phrase in text_lower for phrase in holding_phrases)
+
 def scrape_website_deep(url):
     """Crawls website home page, subpages, script blocks, and tests custom domain emails."""
     if not url or 'facebook.com' in url or 'instagram.com' in url:
-        return None
+        return None, False
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
     found_emails = set()
+    is_blank = False
     
-    # 1. Scrape standard page HTML + JS code blocks
     urls_to_check = [url, f"{url.rstrip('/')}/contact", f"{url.rstrip('/')}/about"]
 
     for link in urls_to_check:
         try:
             resp = requests.get(link, headers=BROWSER_HEADERS, timeout=4)
             if resp.status_code == 200:
+                if is_holding_page(resp.text):
+                    is_blank = True
                 found_emails.update(extract_valid_emails(resp.text))
         except Exception:
             continue
 
-    # 2. Custom Domain Fallback: If site is online but blank, construct common domain emails
-    if not found_emails:
-        clean_domain = url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
-        if '.' in clean_domain:
-            found_emails.add(f"info@{clean_domain}")
+    # Custom Domain Fallback: If site is online but blank, construct common domain emails
+    clean_domain = url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+    if not found_emails and '.' in clean_domain:
+        found_emails.add(f"info@{clean_domain}")
 
-    return ", ".join(found_emails) if found_emails else None
+    return (", ".join(found_emails) if found_emails else None), is_blank
 
 def search_bing_for_emails(business_name, loc, domain_name=None):
     """Searches Bing index for business email mentions across web classifieds & domain queries."""
@@ -109,28 +134,45 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     return ", ".join(found_emails) if found_emails else "None Found"
 
 def verify_email_abstract(email, api_key):
-    """Verifies whether an email mailbox is real and deliverable via Abstract API."""
-    if not email or email == "None Found" or not api_key:
-        return "Not Verified"
+    """Verifies email deliverability and format using Abstract API (compatible with Free & Paid tiers)."""
+    if not api_key or api_key == "" or api_key == "YOUR_ABSTRACT_API_KEY_HERE":
+        return "No API Key Provided"
+    if not email or email == "None Found":
+        return "N/A - No Email"
     
-    # Grab the first email if multiple are listed
     primary_email = email.split(',')[0].strip()
     url = f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
     
     try:
-        response = requests.get(url, timeout=4)
+        response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
             deliverability = data.get("deliverability")
+            
+            is_valid_format = data.get("is_valid_format", {}).get("value", False) if isinstance(data.get("is_valid_format"), dict) else data.get("is_valid_format", False)
+            is_disposable = data.get("is_disposable_email", {}).get("value", False) if isinstance(data.get("is_disposable_email"), dict) else data.get("is_disposable_email", False)
+            
+            # Paid Tier Check
             if deliverability == "DELIVERABLE":
                 return "Valid / Deliverable"
             elif deliverability == "UNDELIVERABLE":
                 return "Invalid Inbox"
+            
+            # Free Tier Fallback Check
+            if is_valid_format and not is_disposable:
+                return "Valid Format (Free Tier)"
+            elif is_disposable:
+                return "Disposable / Temporary"
             else:
-                return "Risky / Unknown"
+                return "Invalid Format"
+        elif response.status_code == 401:
+            return "Invalid Abstract Key"
+        elif response.status_code == 429:
+            return "Abstract Limit Reached"
+        else:
+            return f"API Error ({response.status_code})"
     except Exception:
-        return "Verification Skipped"
-    return "Not Verified"
+        return "Verification Failed"
 
 def to_excel(df):
     """Converts a DataFrame into an Excel file buffer."""
@@ -181,10 +223,11 @@ if st.button("🚀 Generate Leads", type="primary"):
             b_reviews = place.get('userRatingCount', 0)
             b_address = place.get('formattedAddress', 'N/A')
             
-            # Step 1: Deep Crawl Website (HomePage + /contact + /about + Domain Fallback)
+            # Step 1: Deep Crawl Website & check for under construction pages
             found_email = None
+            is_blank_site = False
             if b_site:
-                found_email = scrape_website_deep(b_site)
+                found_email, is_blank_site = scrape_website_deep(b_site)
             
             # Step 2: Query Bing Search Engine if missing
             if not found_email or found_email == "None Found":
@@ -194,6 +237,9 @@ if st.button("🚀 Generate Leads", type="primary"):
             email_status = "None Found"
             if found_email and found_email != "None Found":
                 email_status = verify_email_abstract(found_email, abstract_api_key)
+            
+            # Reclassify under-construction sites as "None" so they go to NO_WEBSITE (Prime Targets)
+            final_website = "None" if (not b_site or is_blank_site) else b_site
                 
             raw_data.append({
                 'name': b_name,
@@ -202,7 +248,7 @@ if st.button("🚀 Generate Leads", type="primary"):
                 'verification_status': email_status,
                 'rating': b_rating,
                 'reviews': b_reviews,
-                'website': b_site if b_site else 'None',
+                'website': final_website,
                 'address': b_address
             })
             
@@ -253,37 +299,3 @@ if st.button("🚀 Generate Leads", type="primary"):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
-def verify_email_abstract(email, api_key):
-    """Verifies email deliverability using Abstract API and provides precise status feedback."""
-    if not api_key or api_key == "":
-        return "No API Key Provided"
-    if not email or email == "None Found":
-        return "N/A - No Email"
-    
-    # Grab primary email if multiple are listed
-    primary_email = email.split(',')[0].strip()
-    url = f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
-    
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            deliverability = data.get("deliverability")
-            is_valid_format = data.get("is_valid_format", {}).get("value", False)
-            
-            if deliverability == "DELIVERABLE":
-                return "Valid / Deliverable"
-            elif deliverability == "UNDELIVERABLE":
-                return "Invalid Inbox"
-            elif is_valid_format:
-                return "Risky / Catch-All"
-            else:
-                return "Invalid Format"
-        elif response.status_code == 401:
-            return "Invalid Abstract Key"
-        elif response.status_code == 429:
-            return "Abstract Limit Reached"
-        else:
-            return f"API Error ({response.status_code})"
-    except Exception as e:
-        return "Request Failed"
