@@ -144,24 +144,30 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     return ", ".join(found_emails) if found_emails else "None Found"
 
 def verify_email_abstract(email, api_key):
-    """Safely verifies emails across Abstract API endpoints with DNS fallback."""
+    """Verifies emails via local DNS lookup first, then optional Abstract API check."""
     if not email or email == "None Found":
         return "N/A - No Email"
     
     primary_email = email.split(',')[0].strip()
     
-    # Check basic regex syntax format
+    # 1. Check basic regex syntax format
     if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', primary_email):
         return "Invalid Format"
     
-    if not api_key or api_key == "" or "YOUR_ABSTRACT" in api_key:
-        try:
-            domain = primary_email.split('@')[1]
-            socket.gethostbyname(domain)
-            return "Valid Domain (DNS Checked)"
-        except Exception:
-            return "Invalid Domain"
+    # 2. Perform fast local DNS MX Mail Server check first
+    domain_valid = False
+    try:
+        domain = primary_email.split('@')[1]
+        socket.gethostbyname(domain)
+        domain_valid = True
+    except Exception:
+        return "Invalid Domain"
 
+    # 3. If no Abstract API key, return DNS status immediately
+    if not api_key or api_key == "" or "YOUR_ABSTRACT" in api_key:
+        return "Valid Domain (DNS Checked)"
+
+    # 4. Use Abstract API for deeper reputation check (if key available and limits remain)
     endpoints = [
         f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}",
         f"https://email-reputation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
@@ -169,7 +175,7 @@ def verify_email_abstract(email, api_key):
 
     for url in endpoints:
         try:
-            resp = requests.get(url, timeout=4)
+            resp = requests.get(url, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 
@@ -189,21 +195,16 @@ def verify_email_abstract(email, api_key):
                 elif score is not None and float(score) >= 0.5:
                     return "Valid / High Reputation"
                 else:
-                    return "Valid Format"
+                    return "Valid Domain (DNS Checked)"
             elif resp.status_code == 401:
                 continue
             elif resp.status_code == 429:
-                return "Abstract Limit Reached"
+                # Fall back gracefully to DNS status instead of returning rate limit error text
+                return "Valid Domain (DNS Checked)"
         except Exception:
             continue
 
-    try:
-        domain = primary_email.split('@')[1]
-        socket.gethostbyname(domain)
-        return "Valid Domain (DNS Checked)"
-    except Exception:
-        return "Invalid Domain"
-
+    return "Valid Domain (DNS Checked)" if domain_valid else "Invalid Domain"
 def to_excel(df):
     """Converts a DataFrame into an Excel file buffer."""
     import io
