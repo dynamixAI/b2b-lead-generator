@@ -11,19 +11,19 @@ st.set_page_config(page_title="UK B2B Lead Generator", page_icon="🎯", layout=
 st.title("🎯 UK B2B Lead Generator")
 st.write("Generate local business leads, split automatically by web presence.")
 
-# Sidebar Configuration for API Key
+# Sidebar Configuration
 st.sidebar.header("Settings")
 api_key_input = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
 
-# Main Form Inputs
+# Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
 location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, WN1")
 
 # =========================================================
-# HELPER SCRAPING FUNCTIONS (SILENT EXECUTION)
+# ENHANCED SCRAPING & ENRICHMENT FUNCTIONS
 # =========================================================
 def scrape_email_from_website(url):
-    """Scrapes direct emails from custom business websites without printing logs."""
+    """Scrapes direct emails from custom websites (including under-construction/single page sites)."""
     if not url or 'facebook.com' in url or 'instagram.com' in url:
         return None
     if not url.startswith(('http://', 'https://')):
@@ -41,25 +41,46 @@ def scrape_email_from_website(url):
         return None
     return None
 
-def search_directory_email(business_name, loc):
-    """Searches UK directory listings (Yell, Checkatrade, Thomson, Trustpilot) silently."""
-    query = f'"{business_name}" "{loc}" site:yell.com OR site:checkatrade.com OR site:thomsonlocal.com OR site:trustpilot.com email'
+def deep_web_search_email(business_name, loc, domain_name=None):
+    """
+    Searches the ENTIRE web (classifieds, forums, directories, generic providers)
+    for business emails + tests domain guesses.
+    """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    url = f"https://html.duckduckgo.com/html/?q={query}"
+    found_emails = set()
+
+    # Step 1: Open web search across classifieds, directories, and generic web
+    search_query = f'"{business_name}" "{loc}" email OR contact OR "@gmail.com" OR "@yahoo.co.uk" OR "@btinternet.com" OR "@hotmail.com"'
+    url = f"https://html.duckduckgo.com/html/?q={search_query}"
     
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
             email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            emails = set(re.findall(email_pattern, resp.text))
-            valid = [e for e in emails if not e.endswith(('.png', '.jpg', '.jpeg', '.svg'))]
-            return ", ".join(valid) if valid else "None Found"
+            matches = set(re.findall(email_pattern, resp.text))
+            valid_matches = [e for e in matches if not e.endswith(('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp'))]
+            found_emails.update(valid_matches)
     except Exception:
-        return "None Found"
-    return "None Found"
+        pass
+
+    # Step 2: Domain-specific search if a domain exists (even if site is blank/under construction)
+    if domain_name:
+        clean_domain = domain_name.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+        domain_query = f'"{clean_domain}" email OR "info@{clean_domain}" OR "contact@{clean_domain}"'
+        domain_url = f"https://html.duckduckgo.com/html/?q={domain_query}"
+        try:
+            resp_dom = requests.get(domain_url, headers=headers, timeout=5)
+            if resp_dom.status_code == 200:
+                matches = set(re.findall(email_pattern, resp_dom.text))
+                valid_dom = [e for e in matches if clean_domain in e and not e.endswith(('.png', '.jpg', '.jpeg', '.svg'))]
+                found_emails.update(valid_dom)
+        except Exception:
+            pass
+
+    return ", ".join(found_emails) if found_emails else "None Found"
 
 def to_excel(df):
-    """Converts a DataFrame into an Excel file buffer for instant download."""
+    """Converts a DataFrame into an Excel file buffer."""
     import io
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -77,7 +98,6 @@ if st.button("🚀 Generate Leads", type="primary"):
     else:
         search_query = f"{trade} in {location}, UK"
         
-        # UI Status container right at the top
         status_box = st.empty()
         status_box.info(f"Searching Google Places for: **'{search_query}'**...")
 
@@ -108,14 +128,14 @@ if st.button("🚀 Generate Leads", type="primary"):
             b_reviews = place.get('userRatingCount', 0)
             b_address = place.get('formattedAddress', 'N/A')
             
-            # Step A: Check Website
+            # Step 1: Direct Website Crawl
             found_email = None
             if b_site:
                 found_email = scrape_email_from_website(b_site)
             
-            # Step B: Check UK Directories if no website email found
+            # Step 2: Deep Web Search (Classifieds, Forums, Generic Emails, & Domain Specifics)
             if not found_email or found_email == "None Found":
-                found_email = search_directory_email(b_name, location)
+                found_email = deep_web_search_email(b_name, location, domain_name=b_site)
                 
             raw_data.append({
                 'name': b_name,
@@ -130,7 +150,6 @@ if st.button("🚀 Generate Leads", type="primary"):
             if len(places) > 0:
                 progress_bar.progress((idx + 1) / len(places))
 
-        # Clean up progress bar & status message after run
         status_box.empty()
         progress_bar.empty()
 
@@ -139,13 +158,11 @@ if st.button("🚀 Generate Leads", type="primary"):
         if df.empty:
             st.warning("No results returned. Please verify your Google API key or search query.")
         else:
-            # Separate into 2 clean DataFrames
             no_website_df = df[df['website'] == 'None'].copy()
             has_website_df = df[df['website'] != 'None'].copy()
 
             st.success(f"Scraping Complete! Found {len(df)} total businesses.")
 
-            # Summary Metrics Card
             m1, m2 = st.columns(2)
             m1.metric("🔴 No Website (Prime Targets)", len(no_website_df))
             m2.metric("🟢 Has Website / Socials", len(has_website_df))
@@ -156,7 +173,6 @@ if st.button("🚀 Generate Leads", type="primary"):
             st.write("---")
             st.subheader("📥 Download Your Files")
 
-            # Download Buttons placed right under summary
             d_col1, d_col2 = st.columns(2)
 
             with d_col1:
