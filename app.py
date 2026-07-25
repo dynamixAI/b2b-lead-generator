@@ -253,3 +253,37 @@ if st.button("🚀 Generate Leads", type="primary"):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
+def verify_email_abstract(email, api_key):
+    """Verifies email deliverability using Abstract API and provides precise status feedback."""
+    if not api_key or api_key == "":
+        return "No API Key Provided"
+    if not email or email == "None Found":
+        return "N/A - No Email"
+    
+    # Grab primary email if multiple are listed
+    primary_email = email.split(',')[0].strip()
+    url = f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
+    
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            deliverability = data.get("deliverability")
+            is_valid_format = data.get("is_valid_format", {}).get("value", False)
+            
+            if deliverability == "DELIVERABLE":
+                return "Valid / Deliverable"
+            elif deliverability == "UNDELIVERABLE":
+                return "Invalid Inbox"
+            elif is_valid_format:
+                return "Risky / Catch-All"
+            else:
+                return "Invalid Format"
+        elif response.status_code == 401:
+            return "Invalid Abstract Key"
+        elif response.status_code == 429:
+            return "Abstract Limit Reached"
+        else:
+            return f"API Error ({response.status_code})"
+    except Exception as e:
+        return "Request Failed"
