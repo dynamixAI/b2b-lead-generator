@@ -134,7 +134,7 @@ def search_bing_for_emails(business_name, loc, domain_name=None):
     return ", ".join(found_emails) if found_emails else "None Found"
 
 def verify_email_abstract(email, api_key):
-    """Verifies email deliverability and format using Abstract API (compatible with Free & Paid tiers)."""
+    """Verifies email deliverability using Abstract API's updated API schema."""
     if not api_key or api_key == "" or api_key == "YOUR_ABSTRACT_API_KEY_HERE":
         return "No API Key Provided"
     if not email or email == "None Found":
@@ -147,30 +147,28 @@ def verify_email_abstract(email, api_key):
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            deliverability = data.get("deliverability")
             
-            is_valid_format = data.get("is_valid_format", {}).get("value", False) if isinstance(data.get("is_valid_format"), dict) else data.get("is_valid_format", False)
-            is_disposable = data.get("is_disposable_email", {}).get("value", False) if isinstance(data.get("is_disposable_email"), dict) else data.get("is_disposable_email", False)
+            # Handle new nested response structure
+            deliv_obj = data.get("email_deliverability", {})
+            status = deliv_obj.get("status") if isinstance(deliv_obj, dict) else data.get("deliverability")
             
-            # Paid Tier Check
-            if deliverability == "DELIVERABLE":
+            is_valid_format = deliv_obj.get("is_format_valid") if isinstance(deliv_obj, dict) else data.get("is_valid_format")
+            
+            if status in ["deliverable", "DELIVERABLE"]:
                 return "Valid / Deliverable"
-            elif deliverability == "UNDELIVERABLE":
+            elif status in ["undeliverable", "UNDELIVERABLE"]:
                 return "Invalid Inbox"
-            
-            # Free Tier Fallback Check
-            if is_valid_format and not is_disposable:
-                return "Valid Format (Free Tier)"
-            elif is_disposable:
-                return "Disposable / Temporary"
+            elif is_valid_format:
+                return "Valid Format"
             else:
-                return "Invalid Format"
+                return "Risky / Unknown"
+                
         elif response.status_code == 401:
             return "Invalid Abstract Key"
         elif response.status_code == 429:
             return "Abstract Limit Reached"
         else:
-            return f"API Error ({response.status_code})"
+            return f"API Status ({response.status_code})"
     except Exception:
         return "Verification Failed"
 
