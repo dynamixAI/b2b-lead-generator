@@ -21,7 +21,7 @@ google_api_key = st.sidebar.text_input(
 )
 abstract_api_key = st.sidebar.text_input(
     "Abstract Email Verification API Key", 
-    value="e59e13328e31483b951f96faf09db91e", 
+    value="60b087f0bc0a47259b5ea828b2babf93", 
     type="password", 
     help="Optional: Enter your key to verify email deliverability."
 )
