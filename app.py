@@ -15,7 +15,7 @@ st.write("Extract local trade listings, crawl custom domains, and verify email d
 # Sidebar Configuration
 st.sidebar.header("API Configurations")
 google_api_key = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
-abstract_api_key = st.sidebar.text_input("e59e13328e31483b951f96faf09db91e", value="", type="password", help="Optional: Leave blank to skip email verification.")
+abstract_api_key = st.sidebar.text_input("Abstract Email Verification API Key", value="e59e13328e31483b951f96faf09db91e", type="password", help="Optional: Leave blank to skip email verification.")
 
 # Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
