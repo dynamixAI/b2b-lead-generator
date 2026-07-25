@@ -32,6 +32,14 @@ abstract_api_key = st.sidebar.text_input(
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
 location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, Oxford")
 
+# Initialize Session State variables
+if "results_df" not in st.session_state:
+    st.session_state.results_df = None
+
+# Callback to clear results
+def reset_search():
+    st.session_state.results_df = None
+
 # =========================================================
 # BROWSER EMULATION HEADERS & REGEX
 # =========================================================
@@ -147,7 +155,6 @@ def verify_email_abstract(email, api_key):
         return "Invalid Format"
     
     if not api_key or api_key == "" or "YOUR_ABSTRACT" in api_key:
-        # Direct DNS MX Mail Server check if no API key is set
         try:
             domain = primary_email.split('@')[1]
             socket.gethostbyname(domain)
@@ -155,7 +162,6 @@ def verify_email_abstract(email, api_key):
         except Exception:
             return "Invalid Domain"
 
-    # Multi-endpoint check: Try Email Validation and Email Reputation APIs
     endpoints = [
         f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}",
         f"https://email-reputation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
@@ -167,7 +173,6 @@ def verify_email_abstract(email, api_key):
             if resp.status_code == 200:
                 data = resp.json()
                 
-                # Check deliverability
                 deliv = data.get("deliverability")
                 if not deliv and isinstance(data.get("email_deliverability"), dict):
                     deliv = data.get("email_deliverability", {}).get("status")
@@ -192,7 +197,6 @@ def verify_email_abstract(email, api_key):
         except Exception:
             continue
 
-    # Fallback to local DNS check if API call fails
     try:
         domain = primary_email.split('@')[1]
         socket.gethostbyname(domain)
@@ -209,9 +213,17 @@ def to_excel(df):
     return output.getvalue()
 
 # =========================================================
-# RUN SCRAPER ACTION (PAGINATED UP TO 60 LEADS)
+# ACTION BUTTONS (GENERATE & RESET)
 # =========================================================
-if st.button("🚀 Generate Leads", type="primary"):
+col_gen, col_rst = st.columns([3, 1])
+
+with col_gen:
+    generate_btn = st.button("🚀 Generate Leads", type="primary", use_container_width=True)
+
+with col_rst:
+    st.button("🔄 Clear / Reset", on_click=reset_search, use_container_width=True)
+
+if generate_btn:
     if not trade or not location:
         st.error("Please enter both a Trade and Location.")
     elif not google_api_key or google_api_key == "YOUR_GOOGLE_PLACES_API_KEY_HERE":
@@ -232,7 +244,7 @@ if st.button("🚀 Generate Leads", type="primary"):
         places = []
         next_page_token = None
         
-        # Paginate to fetch up to 3 pages (maximum 60 leads per query)
+        # Paginate up to 3 pages (maximum 60 leads per query)
         for page in range(3):
             payload = {"textQuery": search_query, "pageSize": 20}
             if next_page_token:
@@ -246,9 +258,9 @@ if st.button("🚀 Generate Leads", type="primary"):
                 
                 next_page_token = data.get('nextPageToken')
                 if not next_page_token:
-                    break # Stop early if no more results exist
+                    break
                     
-                time.sleep(1.5) # Required delay for Google page token readiness
+                time.sleep(1.5)
             except Exception as e:
                 st.error(f"API Request failed: {e}")
                 break
@@ -264,22 +276,21 @@ if st.button("🚀 Generate Leads", type="primary"):
             b_reviews = place.get('userRatingCount', 0)
             b_address = place.get('formattedAddress', 'N/A')
             
-            # Step 1: Deep Crawl Website & check for under construction pages
+            # Step 1: Deep Crawl Website
             found_email = None
             is_blank_site = False
             if b_site:
                 found_email, is_blank_site = scrape_website_deep(b_site)
             
-            # Step 2: Query Bing Search Engine if missing
+            # Step 2: Query Bing
             if not found_email or found_email == "None Found":
                 found_email = search_bing_for_emails(b_name, location, domain_name=b_site)
             
-            # Step 3: Abstract API Email Verification (or local DNS check)
+            # Step 3: Verify Email
             email_status = "None Found"
             if found_email and found_email != "None Found":
                 email_status = verify_email_abstract(found_email, abstract_api_key)
             
-            # Reclassify under-construction sites as "None" so they go to NO_WEBSITE (Prime Targets)
             final_website = "None" if (not b_site or is_blank_site) else b_site
                 
             raw_data.append({
@@ -299,44 +310,53 @@ if st.button("🚀 Generate Leads", type="primary"):
         status_box.empty()
         progress_bar.empty()
 
-        df = pd.DataFrame(raw_data)
+        # Save DataFrame into session_state memory
+        st.session_state.results_df = pd.DataFrame(raw_data)
 
-        if df.empty:
-            st.warning("No results returned. Please verify your Google API key or search query.")
-        else:
-            no_website_df = df[df['website'] == 'None'].copy()
-            has_website_df = df[df['website'] != 'None'].copy()
+# =========================================================
+# DISPLAY & DOWNLOAD SECTION (PERSISTENT & RESETTABLE)
+# =========================================================
+if st.session_state.results_df is not None:
+    df = st.session_state.results_df
 
-            st.success(f"Scraping Complete! Found {len(df)} total businesses.")
+    if df.empty:
+        st.warning("No results returned. Please verify your Google API key or search query.")
+    else:
+        no_website_df = df[df['website'] == 'None'].copy()
+        has_website_df = df[df['website'] != 'None'].copy()
 
-            m1, m2 = st.columns(2)
-            m1.metric("🔴 No Website (Prime Targets)", len(no_website_df))
-            m2.metric("🟢 Has Website / Socials", len(has_website_df))
+        st.success(f"Scraping Complete! Found {len(df)} total businesses.")
 
-            clean_trade = re.sub(r'\W+', '_', trade.lower())
-            clean_loc = re.sub(r'\W+', '_', location.lower())
+        m1, m2 = st.columns(2)
+        m1.metric("🔴 No Website (Prime Targets)", len(no_website_df))
+        m2.metric("🟢 Has Website / Socials", len(has_website_df))
 
-            st.write("---")
-            st.subheader("📥 Download Your Files")
+        clean_trade = re.sub(r'\W+', '_', trade.lower()) if trade else "trade"
+        clean_loc = re.sub(r'\W+', '_', location.lower()) if location else "location"
 
-            d_col1, d_col2 = st.columns(2)
+        st.write("---")
+        st.subheader("📥 Download Your Files")
 
-            with d_col1:
-                excel_no_site = to_excel(no_website_df)
-                st.download_button(
-                    label="Download No_Website_Leads.xlsx",
-                    data=excel_no_site,
-                    file_name=f"{clean_trade}_{clean_loc}_NO_WEBSITE.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+        d_col1, d_col2 = st.columns(2)
 
-            with d_col2:
-                excel_has_site = to_excel(has_website_df)
-                st.download_button(
-                    label="Download Has_Website_Leads.xlsx",
-                    data=excel_has_site,
-                    file_name=f"{clean_trade}_{clean_loc}_HAS_WEBSITE.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+        with d_col1:
+            excel_no_site = to_excel(no_website_df)
+            st.download_button(
+                label="Download No_Website_Leads.xlsx",
+                data=excel_no_site,
+                file_name=f"{clean_trade}_{clean_loc}_NO_WEBSITE.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_no_site"
+            )
+
+        with d_col2:
+            excel_has_site = to_excel(has_website_df)
+            st.download_button(
+                label="Download Has_Website_Leads.xlsx",
+                data=excel_has_site,
+                file_name=f"{clean_trade}_{clean_loc}_HAS_WEBSITE.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_has_site"
+            )
