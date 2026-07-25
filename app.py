@@ -1,5 +1,6 @@
 import re
 import socket
+import time
 import urllib.parse
 import requests
 import pandas as pd
@@ -17,12 +18,12 @@ st.write("Extract local trade listings, crawl custom domains, and verify email d
 st.sidebar.header("API Configurations")
 google_api_key = st.sidebar.text_input(
     "Google Cloud API Key", 
-    value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", 
+    value="YOUR_GOOGLE_PLACES_API_KEY_HERE", 
     type="password"
 )
 abstract_api_key = st.sidebar.text_input(
     "Abstract Email Verification API Key", 
-    value="e59e13328e31483b951f96faf09db91e", 
+    value="", 
     type="password", 
     help="Enter your Abstract API key to verify email deliverability."
 )
@@ -141,7 +142,7 @@ def verify_email_abstract(email, api_key):
     
     primary_email = email.split(',')[0].strip()
     
-    # Check syntax basic format
+    # Check basic regex syntax format
     if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', primary_email):
         return "Invalid Format"
     
@@ -208,7 +209,7 @@ def to_excel(df):
     return output.getvalue()
 
 # =========================================================
-# RUN SCRAPER ACTION
+# RUN SCRAPER ACTION (PAGINATED UP TO 60 LEADS)
 # =========================================================
 if st.button("🚀 Generate Leads", type="primary"):
     if not trade or not location:
@@ -225,17 +226,32 @@ if st.button("🚀 Generate Leads", type="primary"):
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": google_api_key,
-            "X-Goog-FieldMask": "places.displayName,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.formattedAddress"
+            "X-Goog-FieldMask": "places.displayName,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.formattedAddress,nextPageToken"
         }
-        payload = {"textQuery": search_query}
-
-        try:
-            response = requests.post(new_places_url, headers=headers, json=payload)
-            data = response.json()
-            places = data.get('places', [])
-        except Exception as e:
-            st.error(f"API Request failed: {e}")
-            places = []
+        
+        places = []
+        next_page_token = None
+        
+        # Paginate to fetch up to 3 pages (maximum 60 leads per query)
+        for page in range(3):
+            payload = {"textQuery": search_query, "pageSize": 20}
+            if next_page_token:
+                payload["pageToken"] = next_page_token
+                
+            try:
+                response = requests.post(new_places_url, headers=headers, json=payload)
+                data = response.json()
+                page_places = data.get('places', [])
+                places.extend(page_places)
+                
+                next_page_token = data.get('nextPageToken')
+                if not next_page_token:
+                    break # Stop early if no more results exist
+                    
+                time.sleep(1.5) # Required delay for Google page token readiness
+            except Exception as e:
+                st.error(f"API Request failed: {e}")
+                break
 
         raw_data = []
         progress_bar = st.progress(0)
