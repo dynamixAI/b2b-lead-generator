@@ -1,4 +1,5 @@
 import re
+import urllib.parse
 import requests
 import pandas as pd
 import streamlit as st
@@ -9,71 +10,100 @@ import streamlit as st
 st.set_page_config(page_title="UK B2B Lead Generator", page_icon="🎯", layout="centered")
 
 st.title("🎯 UK B2B Lead Generator")
-st.write("Generate local business leads, split automatically by web presence.")
+st.write("Extract local trade listings and deep-crawl for direct email contacts.")
 
 # Sidebar Configuration
 st.sidebar.header("Settings")
-api_key_input = st.sidebar.text_input("Google Cloud API Key", value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", type="password")
+api_key_input = st.sidebar.text_input("Google Cloud API Key", value="YOUR_GOOGLE_PLACES_API_KEY_HERE", type="password")
 
 # Main Inputs
 trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
 location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, WN1")
 
 # =========================================================
-# ENHANCED SCRAPING & ENRICHMENT FUNCTIONS
+# BROWSER EMULATION HEADERS
 # =========================================================
-def scrape_email_from_website(url):
-    """Scrapes direct emails from custom websites (including under-construction/single page sites)."""
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+    'Sec-Ch-Ua': '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1'
+}
+
+# Regex to exclude common image extensions misidentified as emails
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+INVALID_EXTS = ('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.css', '.js')
+
+# =========================================================
+# ADVANCED SCRAPING FUNCTIONS
+# =========================================================
+def extract_valid_emails(html_text):
+    """Filters out web assets and extracts clean email addresses from raw HTML."""
+    if not html_text:
+        return set()
+    matches = set(re.findall(EMAIL_REGEX, html_text))
+    return {e for e in matches if not e.lower().endswith(INVALID_EXTS)}
+
+def scrape_website_deep(url):
+    """Crawls website home page and common contact subpages."""
     if not url or 'facebook.com' in url or 'instagram.com' in url:
         return None
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            emails = set(re.findall(email_pattern, response.text))
-            valid = [e for e in emails if not e.endswith(('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp'))]
-            return ", ".join(valid) if valid else None
-    except Exception:
-        return None
-    return None
+    found_emails = set()
+    urls_to_check = [url]
+    
+    # Generate potential contact endpoints
+    base_url = url.rstrip('/')
+    urls_to_check.extend([f"{base_url}/contact", f"{base_url}/contact-us", f"{base_url}/about"])
 
-def deep_web_search_email(business_name, loc, domain_name=None):
-    """
-    Searches the ENTIRE web (classifieds, forums, directories, generic providers)
-    for business emails + tests domain guesses.
-    """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    for link in urls_to_check:
+        try:
+            resp = requests.get(link, headers=BROWSER_HEADERS, timeout=4)
+            if resp.status_code == 200:
+                emails = extract_valid_emails(resp.text)
+                found_emails.update(emails)
+                if found_emails: # Stop early if we hit an email on home page
+                    break
+        except Exception:
+            continue
+
+    return ", ".join(found_emails) if found_emails else None
+
+def search_bing_for_emails(business_name, loc, domain_name=None):
+    """Searches Bing index for business email mentions across web classifieds & domain queries."""
     found_emails = set()
 
-    # Step 1: Open web search across classifieds, directories, and generic web
-    search_query = f'"{business_name}" "{loc}" email OR contact OR "@gmail.com" OR "@yahoo.co.uk" OR "@btinternet.com" OR "@hotmail.com"'
-    url = f"https://html.duckduckgo.com/html/?q={search_query}"
-    
+    # Query 1: Open search on Bing for Business Name + City + Email
+    query1 = f'"{business_name}" "{loc}" email OR contact'
+    bing_url1 = f"https://www.bing.com/search?q={urllib.parse.quote(query1)}"
+
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
+        resp = requests.get(bing_url1, headers=BROWSER_HEADERS, timeout=5)
         if resp.status_code == 200:
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            matches = set(re.findall(email_pattern, resp.text))
-            valid_matches = [e for e in matches if not e.endswith(('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp'))]
-            found_emails.update(valid_matches)
+            found_emails.update(extract_valid_emails(resp.text))
     except Exception:
         pass
 
-    # Step 2: Domain-specific search if a domain exists (even if site is blank/under construction)
-    if domain_name:
+    # Query 2: Search specific custom domain if available
+    if domain_name and 'facebook.com' not in domain_name and 'instagram.com' not in domain_name:
         clean_domain = domain_name.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
-        domain_query = f'"{clean_domain}" email OR "info@{clean_domain}" OR "contact@{clean_domain}"'
-        domain_url = f"https://html.duckduckgo.com/html/?q={domain_query}"
+        query2 = f'"{clean_domain}" email OR "info@{clean_domain}" OR "contact@{clean_domain}"'
+        bing_url2 = f"https://www.bing.com/search?q={urllib.parse.quote(query2)}"
+        
         try:
-            resp_dom = requests.get(domain_url, headers=headers, timeout=5)
-            if resp_dom.status_code == 200:
-                matches = set(re.findall(email_pattern, resp_dom.text))
-                valid_dom = [e for e in matches if clean_domain in e and not e.endswith(('.png', '.jpg', '.jpeg', '.svg'))]
-                found_emails.update(valid_dom)
+            resp2 = requests.get(bing_url2, headers=BROWSER_HEADERS, timeout=5)
+            if resp2.status_code == 200:
+                dom_emails = {e for e in extract_valid_emails(resp2.text) if clean_domain in e.lower()}
+                found_emails.update(dom_emails)
         except Exception:
             pass
 
@@ -128,14 +158,14 @@ if st.button("🚀 Generate Leads", type="primary"):
             b_reviews = place.get('userRatingCount', 0)
             b_address = place.get('formattedAddress', 'N/A')
             
-            # Step 1: Direct Website Crawl
+            # Step 1: Deep Crawl Website (HomePage + /contact + /about)
             found_email = None
             if b_site:
-                found_email = scrape_email_from_website(b_site)
+                found_email = scrape_website_deep(b_site)
             
-            # Step 2: Deep Web Search (Classifieds, Forums, Generic Emails, & Domain Specifics)
+            # Step 2: Query Bing Search Engine if missing
             if not found_email or found_email == "None Found":
-                found_email = deep_web_search_email(b_name, location, domain_name=b_site)
+                found_email = search_bing_for_emails(b_name, location, domain_name=b_site)
                 
             raw_data.append({
                 'name': b_name,
