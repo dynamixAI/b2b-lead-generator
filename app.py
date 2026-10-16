@@ -1,363 +1,383 @@
+import html
+import io
 import re
-import socket
-import time
-import urllib.parse
-import requests
+
 import pandas as pd
 import streamlit as st
 
-# =========================================================
-# PAGE CONFIG & UI STYLING
-# =========================================================
-st.set_page_config(page_title="UK B2B Lead Generator", page_icon="🎯", layout="centered")
+from core.emails import AbstractChecker
+from core.leads import COLUMNS, build_leads, is_closed
+from core.places import PlacesError, search_places
+from core.website import BROKEN, HAS_SITE, HOLDING, NO_SITE, SOCIAL
 
-st.title("🎯 UK B2B Lead Generator & Verifier")
-st.write("Extract local trade listings, crawl custom domains, and verify email deliverability.")
-
-# Sidebar Configuration
-st.sidebar.header("API Configurations")
-google_api_key = st.sidebar.text_input(
-    "Google Cloud API Key", 
-    value="AIzaSyBlB0xgNEmdWnY29ZoZWWFJ7rrZsvjrny4", 
-    type="password"
-)
-abstract_api_key = st.sidebar.text_input(
-    "Abstract Email Verification API Key", 
-    value="e59e13328e31483b951f96faf09db91e", 
-    type="password", 
-    help="Enter your Abstract API key to verify email deliverability."
+st.set_page_config(
+    page_title="Lead Finder",
+    page_icon="◎",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
-# Main Inputs
-trade = st.text_input("Trade / Service", placeholder="e.g. Roofers, Electricians, Plumbers")
-location = st.text_input("Town / Postcode", placeholder="e.g. Wigan, Stockport, Oxford")
-
-# Initialize Session State variables
-if "results_df" not in st.session_state:
-    st.session_state.results_df = None
-
-# Callback to clear results
-def reset_search():
-    st.session_state.results_df = None
-
 # =========================================================
-# BROWSER EMULATION HEADERS & REGEX
+# STYLING
 # =========================================================
-BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-    'Sec-Ch-Ua': '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1'
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+    --bg: #0D0F12;
+    --surface: #16191E;
+    --line: #262A31;
+    --text: #E8EAED;
+    --muted: #8A919C;
+    --accent: #C8F169;
 }
 
-EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-INVALID_EXTS = ('.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.css', '.js')
+html, body, [class*="css"], .stMarkdown, input, button, textarea {
+    font-family: 'DM Sans', sans-serif !important;
+}
 
-# =========================================================
-# ADVANCED SCRAPING & VERIFICATION FUNCTIONS
-# =========================================================
-def extract_valid_emails(html_text):
-    """Filters out web assets and extracts clean email addresses from raw HTML."""
-    if not html_text:
-        return set()
-    matches = set(re.findall(EMAIL_REGEX, html_text))
-    return {e for e in matches if not e.lower().endswith(INVALID_EXTS)}
+[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"],
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], footer {
+    display: none !important;
+}
 
-def is_holding_page(html_text):
-    """Detects standard blank or under-construction landing pages."""
-    if not html_text:
-        return True
-    holding_phrases = [
-        "under construction", 
-        "coming soon", 
-        "check back soon", 
-        "domain for sale", 
-        "website under maintenance",
-        "parked domain"
-    ]
-    text_lower = html_text.lower()
-    return any(phrase in text_lower for phrase in holding_phrases)
+.block-container, [data-testid="stMainBlockContainer"] {
+    max-width: 880px;
+    padding-top: 4.5rem;
+    padding-bottom: 5rem;
+}
 
-def scrape_website_deep(url):
-    """Crawls website home page, subpages, script blocks, and tests custom domain emails."""
-    if not url or 'facebook.com' in url or 'instagram.com' in url:
-        return None, False
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+.eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1.1rem;
+}
+.eyebrow span { color: var(--muted); }
 
-    found_emails = set()
-    is_blank = False
-    
-    urls_to_check = [url, f"{url.rstrip('/')}/contact", f"{url.rstrip('/')}/about"]
+.hero {
+    font-family: 'Instrument Serif', Georgia, serif !important;
+    font-weight: 400;
+    font-size: clamp(2.6rem, 6vw, 3.9rem);
+    line-height: 1.02;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    margin: 0 0 1.1rem 0;
+}
+.hero em { color: var(--accent); }
 
-    for link in urls_to_check:
-        try:
-            resp = requests.get(link, headers=BROWSER_HEADERS, timeout=4)
-            if resp.status_code == 200:
-                if is_holding_page(resp.text):
-                    is_blank = True
-                found_emails.update(extract_valid_emails(resp.text))
-        except Exception:
-            continue
+.lede {
+    color: var(--muted);
+    font-size: 1.02rem;
+    line-height: 1.6;
+    max-width: 560px;
+    margin-bottom: 2.4rem;
+}
 
-    # Custom Domain Fallback: If site is online but blank, construct common domain emails
-    clean_domain = url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
-    if not found_emails and '.' in clean_domain:
-        found_emails.add(f"info@{clean_domain}")
+[data-testid="stForm"] {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 1.4rem 1.4rem 1.1rem;
+}
 
-    return (", ".join(found_emails) if found_emails else None), is_blank
+[data-testid="stTextInput"] label p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+[data-testid="stTextInput"] input {
+    background: var(--bg);
+    border-radius: 8px;
+    font-size: 1rem;
+    padding: 0.75rem 0.9rem;
+}
 
-def search_bing_for_emails(business_name, loc, domain_name=None):
-    """Searches Bing index for business email mentions across web classifieds & domain queries."""
-    found_emails = set()
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stDownloadButton"] button {
+    border-radius: 8px;
+    font-weight: 600;
+    padding: 0.7rem 1rem;
+    transition: transform .12s ease, opacity .12s ease, border-color .12s ease;
+}
+[data-testid="stBaseButton-primaryFormSubmit"] {
+    background: var(--accent) !important;
+    color: #0D0F12 !important;
+    border: none !important;
+}
+[data-testid="stBaseButton-primaryFormSubmit"]:hover {
+    opacity: .9;
+    transform: translateY(-1px);
+}
+[data-testid="stBaseButton-secondaryFormSubmit"],
+[data-testid="stDownloadButton"] button {
+    background: transparent !important;
+    color: var(--text) !important;
+    border: 1px solid var(--line) !important;
+}
+[data-testid="stBaseButton-secondaryFormSubmit"]:hover,
+[data-testid="stDownloadButton"] button:hover {
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+}
 
-    query1 = f'"{business_name}" "{loc}" email OR contact'
-    bing_url1 = f"https://www.bing.com/search?q={urllib.parse.quote(query1)}"
+.stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    margin: 2.6rem 0 1.8rem;
+}
+.stat {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1rem 1.1rem;
+}
+.stat .num {
+    font-family: 'Instrument Serif', Georgia, serif !important;
+    font-size: 2.4rem;
+    line-height: 1;
+    color: var(--text);
+}
+.stat.hot .num { color: var(--accent); }
+.stat .lbl {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: 0.5rem;
+}
+@media (max-width: 640px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+}
 
+.section-title {
+    font-family: 'Instrument Serif', Georgia, serif !important;
+    font-size: 1.7rem;
+    color: var(--text);
+    margin: 0.4rem 0 0.2rem;
+}
+.section-sub { color: var(--muted); font-size: 0.92rem; margin-bottom: 1rem; }
+
+[data-testid="stTabs"] button p { font-weight: 500; }
+
+.note-line {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: -0.8rem 0 1.2rem;
+}
+
+.status-line {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+def get_secret(name):
     try:
-        resp = requests.get(bing_url1, headers=BROWSER_HEADERS, timeout=5)
-        if resp.status_code == 200:
-            found_emails.update(extract_valid_emails(resp.text))
+        return st.secrets.get(name, "")
     except Exception:
-        pass
+        return ""
 
-    if domain_name and 'facebook.com' not in domain_name and 'instagram.com' not in domain_name:
-        clean_domain = domain_name.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
-        query2 = f'"{clean_domain}" email OR "info@{clean_domain}" OR "contact@{clean_domain}"'
-        bing_url2 = f"https://www.bing.com/search?q={urllib.parse.quote(query2)}"
-        
-        try:
-            resp2 = requests.get(bing_url2, headers=BROWSER_HEADERS, timeout=5)
-            if resp2.status_code == 200:
-                dom_emails = {e for e in extract_valid_emails(resp2.text) if clean_domain in e.lower()}
-                found_emails.update(dom_emails)
-        except Exception:
-            pass
 
-    return ", ".join(found_emails) if found_emails else "None Found"
+google_api_key = get_secret("GOOGLE_API_KEY")
+abstract_api_key = get_secret("ABSTRACT_API_KEY")
 
-def verify_email_abstract(email, api_key):
-    """Verifies emails via local DNS lookup first, then optional Abstract API check."""
-    if not email or email == "None Found":
-        return "N/A - No Email"
-    
-    primary_email = email.split(',')[0].strip()
-    
-    # 1. Check basic regex syntax format
-    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', primary_email):
-        return "Invalid Format"
-    
-    # 2. Perform fast local DNS MX Mail Server check first
-    domain_valid = False
-    try:
-        domain = primary_email.split('@')[1]
-        socket.gethostbyname(domain)
-        domain_valid = True
-    except Exception:
-        return "Invalid Domain"
+for key, default in {"results_df": None, "last_search": ("", ""), "closed_removed": 0}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-    # 3. If no Abstract API key, return DNS status immediately
-    if not api_key or api_key == "" or "YOUR_ABSTRACT" in api_key:
-        return "Valid Domain (DNS Checked)"
+GROUPS = [
+    ("No website", [NO_SITE]),
+    ("Social or directory", [SOCIAL]),
+    ("Broken or holding", [BROKEN, HOLDING]),
+    ("Has website", [HAS_SITE]),
+]
 
-    # 4. Use Abstract API for deeper reputation check (if key available and limits remain)
-    endpoints = [
-        f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}",
-        f"https://email-reputation.abstractapi.com/v1/?api_key={api_key}&email={primary_email}"
-    ]
+TABLE_COLUMNS = [
+    "name", "phone", "website_status", "website", "email", "email_source",
+    "email_check", "other_emails", "rating", "reviews", "address", "google_maps", "note",
+]
 
-    for url in endpoints:
-        try:
-            resp = requests.get(url, timeout=3)
-            if resp.status_code == 200:
-                data = resp.json()
-                
-                deliv = data.get("deliverability")
-                if not deliv and isinstance(data.get("email_deliverability"), dict):
-                    deliv = data.get("email_deliverability", {}).get("status")
-                
-                score = data.get("quality_score")
-                is_disposable = data.get("is_disposable_email", {}).get("value", False) if isinstance(data.get("is_disposable_email"), dict) else data.get("is_disposable_email", False)
-                
-                if is_disposable:
-                    return "Disposable Email"
-                elif deliv and str(deliv).upper() == "DELIVERABLE":
-                    return "Valid / Deliverable"
-                elif deliv and str(deliv).upper() == "UNDELIVERABLE":
-                    return "Invalid Inbox"
-                elif score is not None and float(score) >= 0.5:
-                    return "Valid / High Reputation"
-                else:
-                    return "Valid Domain (DNS Checked)"
-            elif resp.status_code == 401:
-                continue
-            elif resp.status_code == 429:
-                # Fall back gracefully to DNS status instead of returning rate limit error text
-                return "Valid Domain (DNS Checked)"
-        except Exception:
-            continue
 
-    return "Valid Domain (DNS Checked)" if domain_valid else "Invalid Domain"
 def to_excel(df):
-    """Converts a DataFrame into an Excel file buffer."""
-    import io
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.drop(columns=["lat", "lng", "place_id"]).to_excel(writer, sheet_name="All leads", index=False)
+        for label, statuses in GROUPS:
+            part = df[df["website_status"].isin(statuses)]
+            part.drop(columns=["lat", "lng", "place_id"]).to_excel(writer, sheet_name=label, index=False)
     return output.getvalue()
 
+
+def show_table(df):
+    df = df.replace({"website": {"": None}, "google_maps": {"": None}})
+    # hide columns that are empty for every row in this group
+    columns = [
+        c for c in TABLE_COLUMNS
+        if c in ("name", "phone", "website_status") or df[c].replace("", None).notna().any()
+    ]
+    st.dataframe(
+        df,
+        hide_index=True,
+        width="stretch",
+        column_order=columns,
+        column_config={
+            "name": "Business",
+            "phone": "Phone",
+            "website_status": "Website status",
+            "website": st.column_config.LinkColumn("Website"),
+            "email": "Email",
+            "email_source": "Email source",
+            "email_check": "Email check",
+            "other_emails": "Other emails",
+            "rating": st.column_config.NumberColumn("Rating", format="%.1f ★"),
+            "reviews": "Reviews",
+            "address": "Address",
+            "google_maps": st.column_config.LinkColumn("Maps", display_text="Open"),
+            "note": "Note",
+        },
+    )
+
+
+def run_search(trade, location):
+    query = f"{trade} in {location}, UK"
+    status = st.empty()
+    status.markdown(
+        f'<div class="status-line">Searching Google Places for "{html.escape(query)}"…</div>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        places = search_places(query, google_api_key)
+    except PlacesError as e:
+        status.empty()
+        st.error(f"Google Places: {e}")
+        return None, 0
+
+    open_places = [p for p in places if not is_closed(p)]
+    closed = len(places) - len(open_places)
+    if not open_places:
+        status.empty()
+        return pd.DataFrame(columns=COLUMNS), closed
+
+    progress = st.progress(0.0)
+
+    def on_progress(done, total, name):
+        progress.progress(done / total)
+        status.markdown(
+            f'<div class="status-line">Checked {done} of {total} · {html.escape(name)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    abstract = AbstractChecker(abstract_api_key) if abstract_api_key else None
+    rows = build_leads(open_places, trade, location, abstract=abstract, on_progress=on_progress)
+
+    status.empty()
+    progress.empty()
+    return pd.DataFrame(rows, columns=COLUMNS), closed
+
+
 # =========================================================
-# ACTION BUTTONS (GENERATE & RESET)
+# PAGE
 # =========================================================
-col_gen, col_rst = st.columns([3, 1])
+st.markdown('<div class="eyebrow">DynamixAI <span>/ Lead Finder</span></div>', unsafe_allow_html=True)
+st.markdown('<h1 class="hero">Find local trades<br>that <em>need a website.</em></h1>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="lede">Search any UK town for a trade. Each business is checked for a working '
+    'website and a contact email, then split into lists you can download.</p>',
+    unsafe_allow_html=True,
+)
 
-with col_gen:
-    generate_btn = st.button("🚀 Generate Leads", type="primary", use_container_width=True)
+if not google_api_key:
+    st.error("No Google API key found. Add GOOGLE_API_KEY to .streamlit/secrets.toml and restart the app.")
+    st.stop()
 
-with col_rst:
-    st.button("🔄 Clear / Reset", on_click=reset_search, use_container_width=True)
+with st.form("search", border=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        trade = st.text_input("Trade", placeholder="Roofers, electricians, plumbers…")
+    with c2:
+        location = st.text_input("Town or postcode", placeholder="Wigan, Stockport, WN1…")
+    b1, b2 = st.columns([3, 1])
+    with b1:
+        submitted = st.form_submit_button("Find leads", type="primary", width="stretch")
+    with b2:
+        cleared = st.form_submit_button("Clear", type="secondary", width="stretch")
 
-if generate_btn:
-    if not trade or not location:
-        st.error("Please enter both a Trade and Location.")
-    elif not google_api_key or google_api_key == "YOUR_GOOGLE_PLACES_API_KEY_HERE":
-        st.error("Please enter a valid Google Places API Key in the sidebar.")
+if cleared:
+    st.session_state.results_df = None
+
+if submitted:
+    if not trade.strip() or not location.strip():
+        st.warning("Enter both a trade and a town.")
     else:
-        search_query = f"{trade} in {location}, UK"
-        
-        status_box = st.empty()
-        status_box.info(f"Searching Google Places for: **'{search_query}'**...")
+        result, closed = run_search(trade.strip(), location.strip())
+        if result is not None:
+            st.session_state.results_df = result
+            st.session_state.last_search = (trade.strip(), location.strip())
+            st.session_state.closed_removed = closed
 
-        new_places_url = "https://places.googleapis.com/v1/places:searchText"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": google_api_key,
-            "X-Goog-FieldMask": "places.displayName,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.formattedAddress,nextPageToken"
-        }
-        
-        places = []
-        next_page_token = None
-        
-        # Paginate up to 3 pages (maximum 60 leads per query)
-        for page in range(3):
-            payload = {"textQuery": search_query, "pageSize": 20}
-            if next_page_token:
-                payload["pageToken"] = next_page_token
-                
-            try:
-                response = requests.post(new_places_url, headers=headers, json=payload)
-                data = response.json()
-                page_places = data.get('places', [])
-                places.extend(page_places)
-                
-                next_page_token = data.get('nextPageToken')
-                if not next_page_token:
-                    break
-                    
-                time.sleep(1.5)
-            except Exception as e:
-                st.error(f"API Request failed: {e}")
-                break
+df = st.session_state.results_df
 
-        raw_data = []
-        progress_bar = st.progress(0)
-        
-        for idx, place in enumerate(places):
-            b_name = place.get('displayName', {}).get('text', 'N/A')
-            b_phone = place.get('nationalPhoneNumber', 'N/A')
-            b_site = place.get('websiteUri', None)
-            b_rating = place.get('rating', 'N/A')
-            b_reviews = place.get('userRatingCount', 0)
-            b_address = place.get('formattedAddress', 'N/A')
-            
-            # Step 1: Deep Crawl Website
-            found_email = None
-            is_blank_site = False
-            if b_site:
-                found_email, is_blank_site = scrape_website_deep(b_site)
-            
-            # Step 2: Query Bing
-            if not found_email or found_email == "None Found":
-                found_email = search_bing_for_emails(b_name, location, domain_name=b_site)
-            
-            # Step 3: Verify Email
-            email_status = "None Found"
-            if found_email and found_email != "None Found":
-                email_status = verify_email_abstract(found_email, abstract_api_key)
-            
-            final_website = "None" if (not b_site or is_blank_site) else b_site
-                
-            raw_data.append({
-                'name': b_name,
-                'phone': b_phone,
-                'email': found_email if found_email else 'None Found',
-                'verification_status': email_status,
-                'rating': b_rating,
-                'reviews': b_reviews,
-                'website': final_website,
-                'address': b_address
-            })
-            
-            if len(places) > 0:
-                progress_bar.progress((idx + 1) / len(places))
-
-        status_box.empty()
-        progress_bar.empty()
-
-        # Save DataFrame into session_state memory
-        st.session_state.results_df = pd.DataFrame(raw_data)
-
-# =========================================================
-# DISPLAY & DOWNLOAD SECTION (PERSISTENT & RESETTABLE)
-# =========================================================
-if st.session_state.results_df is not None:
-    df = st.session_state.results_df
-
+if df is not None:
     if df.empty:
-        st.warning("No results returned. Please verify your Google API key or search query.")
+        st.info("No open businesses found for that search. Try a nearby town or a broader trade.")
     else:
-        no_website_df = df[df['website'] == 'None'].copy()
-        has_website_df = df[df['website'] != 'None'].copy()
+        last_trade, last_loc = st.session_state.last_search
+        counts = {label: int(df["website_status"].isin(s).sum()) for label, s in GROUPS}
+        weak = counts["Social or directory"] + counts["Broken or holding"]
+        no_site_count = counts["No website"]
+        real_emails = int(((df["email"] != "") & (df["email_source"] != "Guessed")).sum())
 
-        st.success(f"Scraping Complete! Found {len(df)} total businesses.")
+        st.markdown(f"""
+        <div class="stats">
+            <div class="stat"><div class="num">{len(df)}</div><div class="lbl">Businesses</div></div>
+            <div class="stat hot"><div class="num">{no_site_count}</div><div class="lbl">No website</div></div>
+            <div class="stat"><div class="num">{weak}</div><div class="lbl">Weak web presence</div></div>
+            <div class="stat"><div class="num">{real_emails}</div><div class="lbl">Emails found</div></div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        m1, m2 = st.columns(2)
-        m1.metric("🔴 No Website (Prime Targets)", len(no_website_df))
-        m2.metric("🟢 Has Website / Socials", len(has_website_df))
-
-        clean_trade = re.sub(r'\W+', '_', trade.lower()) if trade else "trade"
-        clean_loc = re.sub(r'\W+', '_', location.lower()) if location else "location"
-
-        st.write("---")
-        st.subheader("📥 Download Your Files")
-
-        d_col1, d_col2 = st.columns(2)
-
-        with d_col1:
-            excel_no_site = to_excel(no_website_df)
-            st.download_button(
-                label="Download No_Website_Leads.xlsx",
-                data=excel_no_site,
-                file_name=f"{clean_trade}_{clean_loc}_NO_WEBSITE.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="btn_no_site"
+        st.markdown(
+            f'<div class="section-title">{html.escape(last_trade.title())} in {html.escape(last_loc.title())}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="section-sub">Sorted with the strongest prospects first. '
+            'Guessed emails are marked, so check them before sending.</div>',
+            unsafe_allow_html=True,
+        )
+        closed = st.session_state.closed_removed
+        if closed:
+            st.markdown(
+                f'<div class="note-line">{closed} permanently closed business{"es" if closed != 1 else ""} left out.</div>',
+                unsafe_allow_html=True,
             )
 
-        with d_col2:
-            excel_has_site = to_excel(has_website_df)
-            st.download_button(
-                label="Download Has_Website_Leads.xlsx",
-                data=excel_has_site,
-                file_name=f"{clean_trade}_{clean_loc}_HAS_WEBSITE.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="btn_has_site"
-            )
+        tabs = st.tabs([f"{label} · {counts[label]}" for label, _ in GROUPS])
+        for tab, (label, statuses) in zip(tabs, GROUPS):
+            with tab:
+                part = df[df["website_status"].isin(statuses)]
+                if part.empty:
+                    st.caption("Nothing in this group.")
+                else:
+                    show_table(part)
+
+        slug = f"{re.sub(r'[^a-z0-9]+', '_', last_trade.lower())}_{re.sub(r'[^a-z0-9]+', '_', last_loc.lower())}"
+        st.download_button(
+            "Download all leads (.xlsx, one sheet per group)",
+            data=to_excel(df),
+            file_name=f"{slug}_leads.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
