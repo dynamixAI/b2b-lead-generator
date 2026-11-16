@@ -1,6 +1,8 @@
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from core.companies import check_company
+from core.findsite import find_website
 from core.emails import check_email, mail_server_status, rank_emails, search_emails_online
 from core.website import BROKEN, HAS_SITE, HOLDING, NO_SITE, SOCIAL, analyse_website
 
@@ -9,7 +11,8 @@ STATUS_ORDER = {NO_SITE: 0, SOCIAL: 1, BROKEN: 2, HOLDING: 3, HAS_SITE: 4}
 COLUMNS = [
     "name", "phone", "website_status", "website", "email", "email_source",
     "email_check", "other_emails", "rating", "reviews", "address",
-    "google_maps", "note", "lat", "lng", "place_id",
+    "google_maps", "ok_to_email", "company_check", "company_number",
+    "note", "lat", "lng", "place_id",
 ]
 
 
@@ -37,6 +40,9 @@ def base_row(place):
         "reviews": place.get("userRatingCount", 0),
         "address": place.get("formattedAddress", ""),
         "google_maps": place.get("googleMapsUri", ""),
+        "ok_to_email": "",
+        "company_check": "",
+        "company_number": "",
         "note": note,
         "lat": loc.get("latitude"),
         "lng": loc.get("longitude"),
@@ -44,8 +50,15 @@ def base_row(place):
     }
 
 
-def build_lead(place, trade, location, abstract=None, use_web_search=True):
+def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_key=None):
     row = base_row(place)
+    # Ltd or LLP? only those can be cold emailed under PECR
+    # (Companies House results already know, so no second lookup)
+    row.update(place.get("_company") or check_company(row["name"], row["address"], ch_key))
+    if not row["website"] and place.get("_find_site"):
+        row["website"] = find_website(row["name"], location, trade)
+        if row["website"]:
+            row["note"] = "; ".join(filter(None, [row["note"], "Website found by web search, check it's theirs"]))
     site = analyse_website(row["website"])
     row["website_status"] = site["status"]
     row["website"] = strip_tracking(site["url"])
@@ -54,6 +67,11 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True):
 
     emails = rank_emails(site["emails"], site["domain"])
     source = "Website" if emails else ""
+
+    # email listed on the map entry itself
+    if not emails and place.get("_email"):
+        emails = [place["_email"].strip().lower()]
+        source = "OpenStreetMap"
 
     if not emails and use_web_search:
         emails = search_emails_online(row["name"], location, trade, site["domain"] or None)
@@ -77,11 +95,11 @@ def is_closed(place):
 
 
 def build_leads(places, trade, location, abstract=None, use_web_search=True,
-                workers=8, on_progress=None):
+                workers=8, on_progress=None, ch_key=None):
     rows = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(build_lead, p, trade, location, abstract, use_web_search): p
+            pool.submit(build_lead, p, trade, location, abstract, use_web_search, ch_key): p
             for p in places
         }
         for done, future in enumerate(as_completed(futures), start=1):
