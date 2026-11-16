@@ -4,7 +4,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -336,16 +336,12 @@ def email_section(con, list_id, info, mailbox):
         with st.expander("Follow-up (sent once, 7 days later, if they haven't replied)"):
             follow_subject = st.text_input("Follow-up subject", tpl["follow_subject"])
             follow_body = st.text_area("Follow-up email", tpl["follow_body"], height=140)
-        c1, c2 = st.columns(2)
-        with c1:
-            daily = st.number_input("New emails per day", 1, 50, int(tpl["daily_limit"]),
-                                    help=f"Keep it low while your domain is new. At most {store.DAILY_CAP} a day go out across all lists.")
-        with c2:
-            auto = st.toggle("Send automatically each weekday morning", bool(tpl["auto_send"]),
-                             help="Needs the morning schedule set up once on this computer, and the computer on at that time.")
+        daily = st.number_input("New emails per day", 1, 50, int(tpl["daily_limit"]),
+                                help=f"Keep it low while your domain is new. At most {store.DAILY_CAP} a day go out across all lists.")
         st.caption(PLACEHOLDER_HELP)
         if st.form_submit_button("Save email", width="stretch"):
-            store.save_template(con, list_id, subject, body, follow_subject, follow_body, daily, auto)
+            store.save_template(con, list_id, subject, body, follow_subject, follow_body, daily,
+                                bool(tpl["auto_send"]))
             st.success("Saved.")
             tpl = store.get_template(con, list_id, DEFAULT_TEMPLATES)
 
@@ -415,9 +411,98 @@ def email_section(con, list_id, info, mailbox):
             )
             st.success("Sending in the background, about 3 minutes apart. Refresh this page to see progress below.")
 
+    schedule_section(con, list_id, tpl)
+
     log_rows = store.send_log(con, list_id, 30)
     if log_rows:
         with st.expander(f"Sent from this list ({len(log_rows)} most recent)"):
             st.dataframe(pd.DataFrame(log_rows).rename(columns={
                 "sent_at": "When", "name": "Business", "email": "Email", "kind": "Type", "ok": "Sent", "error": "Problem"}),
                 hide_index=True, width="stretch")
+
+
+# ---------------------------------------------------------
+# sending at a time you choose
+# ---------------------------------------------------------
+
+TIMER_LINE = "*/5 * * * * cd {dir} && .venv/bin/python send_daily.py >> data/cron.log 2>&1"
+MODES = {"manual": "Only when I click Send now", "weekdays": "Every weekday at a time I choose",
+         "once": "Once, on a day and time I choose"}
+
+
+def timer_installed():
+    # the computer's timer (crontab) that checks every 5 minutes whether a list is due
+    try:
+        out = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "send_daily.py" in out
+
+
+def install_timer():
+    try:
+        current = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        current = ""
+    keep = [l for l in current.splitlines() if "send_daily.py" not in l]
+    new = "\n".join(keep + [TIMER_LINE.format(dir=APP_DIR)]) + "\n"
+    subprocess.run(["crontab", "-"], input=new, text=True, check=True, timeout=5)
+
+
+def _hhmm(value):
+    try:
+        h, m = (int(x) for x in (value or store.DEFAULT_SEND_TIME).split(":")[:2])
+        return time(h, m)
+    except ValueError:
+        return time(8, 45)
+
+
+def schedule_text(tpl):
+    if tpl.get("once_at"):
+        when = datetime.fromisoformat(tpl["once_at"])
+        return f"Scheduled once: {when:%a %d %b} at {when:%H:%M}."
+    if tpl.get("auto_send"):
+        return f"Scheduled: every weekday (Mon to Fri) at {_hhmm(tpl.get('send_time')):%H:%M}."
+    return "Not scheduled: emails only go when you click Send now."
+
+
+def schedule_section(con, list_id, tpl):
+    st.markdown("**When to send**")
+    current = "once" if tpl.get("once_at") else ("weekdays" if tpl.get("auto_send") else "manual")
+    mode = st.radio("When to send", list(MODES), index=list(MODES).index(current), format_func=MODES.get,
+                    key=f"mode_{list_id}", label_visibility="collapsed")
+    send_time, once_at = tpl.get("send_time") or store.DEFAULT_SEND_TIME, ""
+    if mode == "weekdays":
+        t = st.time_input("Time", _hhmm(send_time), step=timedelta(minutes=5), key=f"time_{list_id}")
+        send_time = f"{t:%H:%M}"
+    elif mode == "once":
+        old = datetime.fromisoformat(tpl["once_at"]) if tpl.get("once_at") else None
+        tomorrow = date.today() + timedelta(days=1)
+        c1, c2 = st.columns(2)
+        with c1:
+            d = st.date_input("Day", old.date() if old else tomorrow, min_value=date.today(),
+                              format="DD/MM/YYYY", key=f"day_{list_id}")
+        with c2:
+            t = st.time_input("Time", old.time() if old else _hhmm(send_time), step=timedelta(minutes=5),
+                              key=f"once_time_{list_id}")
+        once_at = datetime.combine(d, t).isoformat(timespec="minutes")
+
+    if st.button("Save when to send", width="stretch", key=f"save_schedule_{list_id}"):
+        if mode == "once" and datetime.fromisoformat(once_at) <= datetime.now():
+            st.error("That time has already passed. Pick a later time, or use Send now.")
+        else:
+            store.save_schedule(con, list_id, DEFAULT_TEMPLATES, mode, send_time, once_at)
+            tpl = store.get_template(con, list_id, DEFAULT_TEMPLATES)
+            st.success(schedule_text(tpl))
+    st.caption(schedule_text(tpl) + " The computer must be on and awake then. If it was asleep, the "
+               f"emails go when it wakes, up to {store.LATE_HOURS} hours late; after that it waits for the next time.")
+
+    if mode != "manual" and not timer_installed():
+        st.warning("This computer's timer isn't set up yet, so scheduled emails won't go. "
+                   "It's a one-off: it checks every 5 minutes whether a list is due.")
+        if st.button("Set up the timer", key=f"timer_{list_id}"):
+            try:
+                install_timer()
+                st.success("Timer set up. Scheduled emails will now go at their times.")
+            except Exception as e:
+                st.error(f"Couldn't set up the timer: {e}")

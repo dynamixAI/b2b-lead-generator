@@ -1,8 +1,9 @@
 """Send outreach emails without the app open.
 
-Run by a schedule each weekday morning (crontab), or by the app's "Send now" button:
-    .venv/bin/python send_daily.py                 # every list with daily sending switched on
-    .venv/bin/python send_daily.py --list 3 --limit 10
+Two ways it runs:
+    .venv/bin/python send_daily.py --list 3 --limit 10   # the app's "Send now" button: one list, straight away
+    .venv/bin/python send_daily.py                       # the timer, every 5 minutes: sends any list whose
+                                                         # chosen time (set in the app) has come
 It reads the mailbox details from .streamlit/secrets.toml and writes what it did to data/send.log.
 Before sending, it reads replies in your inbox, so anyone who unsubscribed or replied is never emailed again.
 """
@@ -29,7 +30,9 @@ def log(line):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     with LOG.open("a") as f:
         f.write(f"{stamp}  {line}\n")
-    print(f"{stamp}  {line}", flush=True)
+    # only echo to the screen when someone is watching, so the timer's log doesn't fill with copies
+    if sys.stdout.isatty():
+        print(f"{stamp}  {line}", flush=True)
 
 
 def mailbox_settings(secrets):
@@ -61,15 +64,27 @@ def take_lock():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--list", type=int, help="only this list (default: lists with daily sending on)")
+    parser.add_argument("--list", type=int, help="send this list straight away (default: lists whose chosen time has come)")
     parser.add_argument("--limit", type=int, help="most first emails for this run (default: the list's daily number)")
     parser.add_argument("--gap", type=float, default=3.0, help="minutes between emails (default 3)")
-    parser.add_argument("--any-day", action="store_true", help="send at weekends too")
     args = parser.parse_args(argv)
 
-    if not args.list and date.today().weekday() >= 5 and not args.any_day:
-        log("Weekend, nothing sent.")
-        return 0
+    con = store.connect()
+    now = datetime.now()
+    if args.list:
+        due = [(args.list, "now")]
+    else:
+        # the timer: which lists' chosen time has come?
+        due = []
+        for list_id, why in store.due_lists(con, now):
+            if why.startswith("missed"):
+                store.mark_ran(con, list_id, why, now)
+                log(f"List {list_name(con, list_id)}: missed its send time (computer was off or asleep), "
+                    "so nothing was sent. It'll go at the next chosen time.")
+            else:
+                due.append((list_id, why))
+        if not due:
+            return 0  # nothing due: stay quiet, this runs every few minutes
 
     secrets = tomllib.loads(SECRETS.read_text()) if SECRETS.exists() else {}
     box = mailbox_settings(secrets)
@@ -77,21 +92,25 @@ def main(argv=None):
     sender = {"email": box["user"], "name": box["name"]}
 
     if not take_lock():
-        log("Another send is still running, so this one stopped.")
-        return 0
+        if args.list:
+            log("Another send is still running, so this one stopped.")
+        return 0  # the timer tries again in a few minutes
     try:
-        return send_lists(args, box, send, sender)
+        # mark the scheduled runs as done first, so a crash can't make them repeat
+        for list_id, why in due:
+            if why != "now":
+                store.mark_ran(con, list_id, why, now)
+        return send_lists(con, [list_id for list_id, _ in due], args, box, send, sender)
     finally:
         LOCK.unlink(missing_ok=True)
 
 
-def send_lists(args, box, send, sender):
-    con = store.connect()
-    lists = [args.list] if args.list else store.auto_send_lists(con)
-    if not lists:
-        log("No lists have daily sending switched on.")
-        return 0
+def list_name(con, list_id):
+    row = con.execute("SELECT name FROM lists WHERE id = ?", (list_id,)).fetchone()
+    return f"'{row['name']}'" if row else str(list_id)
 
+
+def send_lists(con, lists, args, box, send, sender):
     # replies first: someone who said "unsubscribe" yesterday must not get a follow-up today
     try:
         counts = check_replies(con, box["imap_host"], box["user"], box["password"], on_event=log)

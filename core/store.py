@@ -98,6 +98,12 @@ LEAD_COLUMNS = [
     "follow_up_sent",
 ]
 
+# when a list sends by itself: send_time (HH:MM) on weekdays when auto_send is on,
+# once_at (YYYY-MM-DDTHH:MM) for a single run, last_auto = the day the weekday run last went
+SCHEDULE_COLUMNS = ["send_time", "once_at", "last_auto"]
+DEFAULT_SEND_TIME = "08:45"
+LATE_HOURS = 3   # laptop asleep at the time: still send if it wakes within this many hours
+
 # columns added after the first version; older databases get them on connect
 NEW_COLUMNS = ["job_software", "vat_registered", "founded", "tradereports_fit", "follow_up_sent"]
 
@@ -113,6 +119,10 @@ def connect(path=None):
     for col in NEW_COLUMNS:
         if col not in have:
             con.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
+    have_t = {r["name"] for r in con.execute("PRAGMA table_info(templates)")}
+    for col in SCHEDULE_COLUMNS:
+        if col not in have_t:
+            con.execute(f"ALTER TABLE templates ADD COLUMN {col} TEXT")
     if "message_id" not in {r["name"] for r in con.execute("PRAGMA table_info(send_log)")}:
         con.execute("ALTER TABLE send_log ADD COLUMN message_id TEXT")
     con.commit()
@@ -303,7 +313,8 @@ def get_template(con, list_id, defaults):
         return dict(row)
     purpose = con.execute("SELECT purpose FROM lists WHERE id = ?", (list_id,)).fetchone()["purpose"]
     base = defaults.get(purpose) or defaults["Other"]
-    return {"list_id": list_id, **base, "daily_limit": 15, "auto_send": 0}
+    return {"list_id": list_id, **base, "daily_limit": 15, "auto_send": 0,
+            "send_time": DEFAULT_SEND_TIME, "once_at": "", "last_auto": ""}
 
 
 def save_template(con, list_id, subject, body, follow_subject, follow_body, daily_limit=15, auto_send=False):
@@ -425,3 +436,56 @@ def leads_for_reply(con, from_email, reply_to_ids=()):
         return []
     marks = ",".join("?" * len(keys))
     return [dict(r) for r in con.execute(f"SELECT * FROM leads WHERE key IN ({marks}) ORDER BY id", tuple(keys))]
+
+
+# ---------------------------------------------------------
+# sending at a time you choose
+# ---------------------------------------------------------
+
+def save_schedule(con, list_id, defaults, mode, send_time="", once_at=""):
+    """mode: "manual" (only Send now), "weekdays" (every weekday at send_time) or "once" (at once_at)."""
+    if con.execute("SELECT 1 FROM templates WHERE list_id = ?", (list_id,)).fetchone() is None:
+        t = get_template(con, list_id, defaults)
+        save_template(con, list_id, t["subject"], t["body"], t["follow_subject"], t["follow_body"],
+                      t["daily_limit"], False)
+    con.execute("UPDATE templates SET auto_send = ?, send_time = ?, once_at = ? WHERE list_id = ?",
+                (int(mode == "weekdays"), send_time or DEFAULT_SEND_TIME,
+                 once_at if mode == "once" else "", list_id))
+    con.commit()
+
+
+def _at(day, hhmm):
+    h, m = (int(x) for x in (hhmm or DEFAULT_SEND_TIME).split(":")[:2])
+    return datetime(day.year, day.month, day.day, h, m)
+
+
+def due_lists(con, now):
+    """Lists whose chosen time has come: [(list_id, "weekdays" | "once" | "missed_weekdays" | "missed_once")].
+
+    A time missed by more than LATE_HOURS (laptop off all morning) is reported as missed, not sent,
+    so emails don't go out late at night."""
+    out = []
+    late = timedelta(hours=LATE_HOURS)
+    for r in con.execute("SELECT list_id, auto_send, send_time, once_at, last_auto FROM templates"):
+        if r["auto_send"] and now.weekday() < 5 and r["last_auto"] != now.date().isoformat():
+            when = _at(now.date(), r["send_time"])
+            if when <= now <= when + late:
+                out.append((r["list_id"], "weekdays"))
+            elif now > when + late:
+                out.append((r["list_id"], "missed_weekdays"))
+        if r["once_at"]:
+            when = datetime.fromisoformat(r["once_at"])
+            if when <= now <= when + late:
+                out.append((r["list_id"], "once"))
+            elif now > when + late:
+                out.append((r["list_id"], "missed_once"))
+    return out
+
+
+def mark_ran(con, list_id, why, now):
+    # done for today (weekday runs) or done for good (one-off runs), whether it sent or was missed
+    if why.endswith("weekdays"):
+        con.execute("UPDATE templates SET last_auto = ? WHERE list_id = ?", (now.date().isoformat(), list_id))
+    else:
+        con.execute("UPDATE templates SET once_at = '' WHERE list_id = ?", (list_id,))
+    con.commit()

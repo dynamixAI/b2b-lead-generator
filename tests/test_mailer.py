@@ -342,3 +342,63 @@ def test_check_replies_reads_the_inbox_without_changing_it(con):
     assert ("select", True) in imap.calls and "(BODY.PEEK[])" in imap.calls  # read-only, stays unread
     assert imap.calls[-1] == "logout"
     assert store.load_leads(con, lid)[0]["status"] == "Opted out"
+
+
+# --- sending at a chosen time ---
+
+def test_weekday_schedule(con):
+    from core.mailer import DEFAULT_TEMPLATES
+    lid = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
+    store.save_schedule(con, lid, DEFAULT_TEMPLATES, "weekdays", "08:45")
+    tue = datetime(2026, 11, 17, 8, 40)
+    assert store.due_lists(con, tue) == []                                   # not yet
+    assert store.due_lists(con, tue.replace(minute=50)) == [(lid, "weekdays")]
+    store.mark_ran(con, lid, "weekdays", tue.replace(minute=50))
+    assert store.due_lists(con, tue.replace(hour=9)) == []                   # once a day
+    assert store.due_lists(con, datetime(2026, 11, 18, 8, 45)) == [(lid, "weekdays")]  # next day
+    assert store.due_lists(con, datetime(2026, 11, 21, 9, 0)) == []          # Saturday
+    # laptop off all morning: missed, not sent at 8pm
+    assert store.due_lists(con, datetime(2026, 11, 18, 20, 0)) == [(lid, "missed_weekdays")]
+
+
+def test_once_schedule(con):
+    from core.mailer import DEFAULT_TEMPLATES
+    lid = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
+    store.save_schedule(con, lid, DEFAULT_TEMPLATES, "once", once_at="2026-11-21T10:30")
+    assert store.get_template(con, lid, DEFAULT_TEMPLATES)["auto_send"] == 0
+    assert store.due_lists(con, datetime(2026, 11, 21, 10, 0)) == []
+    assert store.due_lists(con, datetime(2026, 11, 21, 10, 35)) == [(lid, "once")]  # weekends are fine
+    store.mark_ran(con, lid, "once", datetime(2026, 11, 21, 10, 35))
+    assert store.due_lists(con, datetime(2026, 11, 21, 11, 0)) == []
+    # back to Send now only
+    store.save_schedule(con, lid, DEFAULT_TEMPLATES, "manual")
+    assert store.due_lists(con, datetime(2026, 11, 23, 8, 45)) == []
+
+
+def test_timer_sends_only_lists_that_are_due(tmp_path, monkeypatch):
+    import send_daily
+    from core.mailer import DEFAULT_TEMPLATES
+    monkeypatch.setattr(send_daily, "LOG", tmp_path / "send.log")
+    monkeypatch.setattr(send_daily, "LOCK", tmp_path / "send.lock")
+    secrets = tmp_path / "secrets.toml"
+    secrets.write_text('SMTP_USER = "pius@tradereports.co.uk"\nSMTP_PASSWORD = "x"\n')
+    monkeypatch.setattr(send_daily, "SECRETS", secrets)
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "d.db")
+    sent = []
+    monkeypatch.setattr(send_daily, "smtp_sender", lambda *a: sent.append)
+    monkeypatch.setattr(sendqueue.time, "sleep", lambda s: None)
+    monkeypatch.setattr(send_daily, "check_replies", lambda *a, **k: {"opted_out": 0, "interested": 0, "replied": 0})
+
+    con = store.connect()
+    due = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
+    later = make_list(con, [lead("B Ltd", "b@b.co.uk", "2")])
+    now = datetime.now()
+    store.save_schedule(con, due, DEFAULT_TEMPLATES, "once",
+                        once_at=(now - timedelta(minutes=2)).isoformat(timespec="minutes"))
+    store.save_schedule(con, later, DEFAULT_TEMPLATES, "once",
+                        once_at=(now + timedelta(hours=1)).isoformat(timespec="minutes"))
+    assert send_daily.main(["--gap", "0"]) == 0
+    assert [m["To"] for m in sent] == ["a@a.co.uk"]
+    # it doesn't run again on the next tick
+    sent.clear()
+    assert send_daily.main(["--gap", "0"]) == 0 and sent == []
