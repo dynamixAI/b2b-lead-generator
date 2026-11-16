@@ -4,7 +4,6 @@ import pytest
 import core.leads as leads
 from core import sources
 from core.companies import check_company, match_score, name_words, postcode_of
-from core.findsite import pick_site, result_links
 from core.website import HAS_SITE
 
 
@@ -154,18 +153,6 @@ def test_osm_rejects_postcode():
         sources.search_osm([("craft", "electrician")], "WN1 2AB")
 
 
-def test_pick_site_skips_directories():
-    html = """<ol>
-      <li class="b_algo"><h2><a href="https://find-and-update.company-information.service.gov.uk/company/1">x</a></h2></li>
-      <li class="b_algo"><h2><a href="https://www.yell.com/biz/hartley-roofing">x</a></h2></li>
-      <li class="b_algo"><h2><a href="https://www.hartleyroofing.co.uk/about">x</a></h2></li>
-    </ol>"""
-    links = result_links(html)
-    assert len(links) == 3
-    assert pick_site(links, "Hartley Roofing Ltd", "roofers", "Wigan") == "https://www.hartleyroofing.co.uk"
-    assert pick_site(links[:2], "Hartley Roofing Ltd", "roofers", "Wigan") == ""
-
-
 def test_build_lead_uses_known_company_and_finds_site(monkeypatch):
     place = sources._place("ch:1", "Hartley Roofing Ltd", "Wigan WN1 2AB",
                            company={"company_check": "Ltd, active", "company_number": "1", "ok_to_email": "Yes"})
@@ -176,4 +163,86 @@ def test_build_lead_uses_known_company_and_finds_site(monkeypatch):
     row = leads.build_lead(place, "roofers", "Wigan", use_web_search=False)
     assert row["ok_to_email"] == "Yes" and row["website"] == "https://hartleyroofing.co.uk"
     assert row["email"] == "info@hartleyroofing.co.uk"
-    assert "web search" in row["note"]
+    assert "found automatically" in row["note"]
+
+
+# --- website finder: domain guessing ---
+
+from core.findsite import guess_domains, guess_website
+
+
+class Page:
+    def __init__(self, text, status=200, url=""):
+        self.text, self.status_code, self.url = text, status, url
+
+
+class PageSession:
+    # answers each URL from a dict; anything else fails like a missing site
+    def __init__(self, pages):
+        self.pages, self.asked = pages, []
+
+    def get(self, url, **kwargs):
+        self.asked.append(url)
+        if url in self.pages:
+            return self.pages[url]
+        import requests
+        raise requests.ConnectionError("no such site")
+
+
+def test_guess_domains():
+    d = guess_domains("Jon Wright Electrical (Wigan) Ltd")
+    assert d[:3] == ["jonwrightelectrical.co.uk", "jonwrightelectrical.com", "jonwrightelectrical.uk"]
+    assert "jon-wright-electrical.co.uk" in d and "jonwright.co.uk" in d
+    assert guess_domains("Ltd") == []
+
+
+def test_guess_website_checks_the_page_mentions_the_business():
+    s = PageSession({
+        "https://jonwrightelectrical.co.uk": Page("<h1>Jon Wright Electrical</h1> Electricians in Wigan"),
+    })
+    assert guess_website("Jon Wright Electrical Ltd", "electricians", "Wigan", session=s) == \
+        "https://jonwrightelectrical.co.uk"
+    # a domain that exists but is someone else's or parked is rejected
+    s = PageSession({"https://jonwrightelectrical.co.uk": Page("This domain is for sale")})
+    assert guess_website("Jon Wright Electrical Ltd", "electricians", "Wigan", session=s) == ""
+
+
+def test_guess_website_rejects_a_page_about_someone_else():
+    # live site, but it's a different business that shares one word
+    s = PageSession({"https://tatesecuritytechnology.co.uk": Page("Visit Tate Modern, London's gallery")})
+    assert guess_website("Tate Security Technology Limited", "electricians", "Wigan", session=s) == ""
+    s = PageSession({"https://tatesecuritytechnology.co.uk": Page("Tate Security: CCTV and alarms")})
+    assert guess_website("Tate Security Technology Limited", "electricians", "Wigan", session=s) == \
+        "https://tatesecuritytechnology.co.uk"
+
+
+def test_no_email_guessing_when_no_site_was_found(monkeypatch):
+    place = sources._place("ch:9", "Tate Security Technology Limited", "Wigan",
+                           company={"company_check": "Ltd, active", "company_number": "9", "ok_to_email": "Yes"})
+    monkeypatch.setattr(leads, "find_website", lambda *a: "")
+    monkeypatch.setattr(leads, "search_emails_online",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not search")))
+    row = leads.build_lead(place, "electricians", "Wigan")
+    assert row["email"] == "" and row["note"] == "No website found online"
+
+
+def test_short_guess_needs_the_town():
+    # homeimprovement.co.uk is a shortened guess, so it must mention the town too
+    page = Page("Home Improvement ideas and offers across the UK")
+    s = PageSession({"https://homeimprovement.co.uk": page})
+    assert guess_website("Home Improvement Woolton Ltd", "builders", "Wigan", session=s) == ""
+    s = PageSession({"https://homeimprovement.co.uk": Page("Home Improvement Woolton, builders in Wigan")})
+    assert guess_website("Home Improvement Woolton Ltd", "builders", "Wigan", session=s) == \
+        "https://homeimprovement.co.uk"
+
+
+def test_business_email_beats_web_designer_email(monkeypatch):
+    place = sources._place("ch:5", "Journey Electrical Ltd", "Wigan",
+                           company={"company_check": "Ltd, active", "company_number": "5", "ok_to_email": "Yes"})
+    monkeypatch.setattr(leads, "find_website", lambda *a: "https://journeyelectrical.co.uk")
+    monkeypatch.setattr(leads, "analyse_website", lambda url: {
+        "status": HAS_SITE, "url": url, "domain": "journeyelectrical.co.uk", "note": "",
+        "emails": {"info.tisodigital@gmail.com", "journey.electrical.service@gmail.com"}})
+    monkeypatch.setattr(leads, "check_email", lambda e, a=None: "ok")
+    row = leads.build_lead(place, "electricians", "Wigan", use_web_search=False)
+    assert row["email"] == "journey.electrical.service@gmail.com"
