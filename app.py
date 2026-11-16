@@ -181,6 +181,17 @@ html, body, [class*="css"], .stMarkdown, input, button, textarea {
     font-size: 0.78rem;
     color: var(--muted);
 }
+/* main buttons outside forms (Send now): lime with dark text, like the form buttons */
+[data-testid="stBaseButton-primary"],
+[data-testid="stBaseButton-primary"] p {
+    background: var(--accent) !important;
+    color: var(--bg) !important;
+    border: none !important;
+    font-weight: 600;
+}
+[data-testid="stBaseButton-primary"]:hover { opacity: .9; }
+/* greyed out while sending */
+[data-testid="stBaseButton-primary"]:disabled { opacity: .55; }
 /* chosen options in multi-selects: dark text on the lime tag, so it's readable */
 [data-testid="stMultiSelect"] [data-tag],
 [data-testid="stMultiSelect"] [data-tag] span,
