@@ -3,7 +3,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.companies import check_company
 from core.findsite import find_website
-from core.emails import check_email, mail_server_status, rank_emails, search_emails_online
+from core.emails import (
+    check_email, email_belongs, mail_server_status, name_tokens, rank_emails, search_emails_online,
+)
 from core.website import BROKEN, HAS_SITE, HOLDING, NO_SITE, SOCIAL, analyse_website
 
 STATUS_ORDER = {NO_SITE: 0, SOCIAL: 1, BROKEN: 2, HOLDING: 3, HAS_SITE: 4}
@@ -57,8 +59,8 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_ke
     row.update(place.get("_company") or check_company(row["name"], row["address"], ch_key))
     if not row["website"] and place.get("_find_site"):
         row["website"] = find_website(row["name"], location, trade)
-        if row["website"]:
-            row["note"] = "; ".join(filter(None, [row["note"], "Website found by web search, check it's theirs"]))
+        found = "Website found automatically, check it's theirs" if row["website"] else "No website found online"
+        row["note"] = "; ".join(filter(None, [row["note"], found]))
     site = analyse_website(row["website"])
     row["website_status"] = site["status"]
     row["website"] = strip_tracking(site["url"])
@@ -66,6 +68,10 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_ke
         row["note"] = "; ".join(filter(None, [row["note"], site["note"]]))
 
     emails = rank_emails(site["emails"], site["domain"])
+    # put emails that match the business first, so a web designer's address
+    # in the footer doesn't get picked over the company's own
+    tokens = name_tokens(row["name"], trade, location)
+    emails.sort(key=lambda e: not email_belongs(e, tokens, site["domain"]))
     source = "Website" if emails else ""
 
     # email listed on the map entry itself
@@ -73,7 +79,10 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_ke
         emails = [place["_email"].strip().lower()]
         source = "OpenStreetMap"
 
-    if not emails and use_web_search:
+    # no website found for a Companies House or map lead: web search results for the
+    # bare name are too often someone else's, so don't guess an email from them
+    unsure = place.get("_find_site") and not row["website"]
+    if not emails and use_web_search and not unsure:
         emails = search_emails_online(row["name"], location, trade, site["domain"] or None)
         source = "Web search" if emails else ""
 
