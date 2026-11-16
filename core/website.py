@@ -1,3 +1,4 @@
+import re
 import urllib.parse
 
 import requests
@@ -98,8 +99,32 @@ def contact_pages(html_text, origin):
     return unique[:3]
 
 
+# links or widgets that job management software puts on a trade's website
+JOB_SOFTWARE = {
+    "Jobber": ("getjobber.com",),
+    "Tradify": ("tradifyhq.com",),
+    "ServiceM8": ("servicem8.com",),
+    "Fergus": ("fergus.com",),
+    "Powered Now": ("powerednow.com",),
+    "Commusoft": ("commusoft.co",),
+    "simPRO": ("simprogroup.com", "simpro.co"),
+}
+
+VAT_NUMBER = re.compile(r"\bVAT\b[^0-9]{0,30}(?:GB)?\s?(\d{3}\s?\d{4}\s?\d{2})\b", re.I)
+
+
+def detect_job_software(html_text):
+    page = (html_text or "").lower()
+    return [name for name, marks in JOB_SOFTWARE.items() if any(m in page for m in marks)]
+
+
+def has_vat_number(html_text):
+    return bool(VAT_NUMBER.search(visible_text(html_text or "")))
+
+
 def analyse_website(url):
-    result = {"status": NO_SITE, "url": url or "", "domain": "", "emails": set(), "note": ""}
+    result = {"status": NO_SITE, "url": url or "", "domain": "", "emails": set(), "note": "",
+              "software": [], "vat": False}
     if not url:
         return result
     if not url.startswith(("http://", "https://")):
@@ -133,6 +158,9 @@ def analyse_website(url):
 
         text = visible_text(home.text)
         result["status"] = HOLDING if is_holding_page(text) else HAS_SITE
+        # signs a business would get value from TradeReports
+        result["software"] = detect_job_software(home.text)
+        result["vat"] = has_vat_number(home.text)
 
         emails = extract_emails(home.text)
         if not emails:

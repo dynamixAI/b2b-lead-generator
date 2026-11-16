@@ -86,7 +86,7 @@ def check_company(name, address, api_key, session=None, retries=2):
     Yes for an active company or LLP, No if not found or not a company,
     Check if the lookup failed.
     """
-    empty = {"company_check": "", "company_number": "", "ok_to_email": ""}
+    empty = {"company_check": "", "company_number": "", "ok_to_email": "", "founded": ""}
     if not api_key or not name:
         return empty
 
@@ -129,4 +129,38 @@ def check_company(name, address, api_key, session=None, retries=2):
         "company_check": text,
         "company_number": best.get("company_number", ""),
         "ok_to_email": ok,
+        "founded": best.get("date_of_creation", ""),
     }
+
+
+OFFICERS_URL = "https://api.company-information.service.gov.uk/company/{number}/officers"
+
+
+def tidy_officer_name(raw):
+    # Companies House gives "SMITH, John Paul" -> "John Smith"
+    if "," not in (raw or ""):
+        return (raw or "").strip().title()
+    surname, forenames = raw.split(",", 1)
+    first = forenames.split()[0] if forenames.split() else ""
+    return f"{first.strip().title()} {surname.strip().title()}".strip()
+
+
+def get_director(company_number, api_key, session=None):
+    """Name of a current director, for addressing a letter. Empty if none found."""
+    if not api_key or not company_number:
+        return ""
+    get = (session or requests).get
+    try:
+        r = get(OFFICERS_URL.format(number=company_number), params={"items_per_page": 35},
+                auth=(api_key, ""), timeout=15)
+    except requests.RequestException:
+        return ""
+    if r.status_code != 200:
+        return ""
+    try:
+        items = r.json().get("items", [])
+    except ValueError:
+        return ""
+    current = [i for i in items if not i.get("resigned_on")]
+    directors = [i for i in current if i.get("officer_role") == "director"] or current
+    return tidy_officer_name(directors[0].get("name", "")) if directors else ""

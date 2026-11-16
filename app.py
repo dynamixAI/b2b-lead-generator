@@ -5,11 +5,13 @@ import re
 import pandas as pd
 import streamlit as st
 
+from core import store
 from core.emails import AbstractChecker
 from core.leads import COLUMNS, build_leads, is_closed
 from core.places import PlacesError, search_places
 from core.sources import TRADE_LIST, SourceError, resolve_trade, search_companies_house, search_osm
 from core.website import BROKEN, HAS_SITE, HOLDING, NO_SITE, SOCIAL
+from lists_ui import lists_page, save_panel
 
 st.set_page_config(
     page_title="Lead Finder",
@@ -179,6 +181,13 @@ html, body, [class*="css"], .stMarkdown, input, button, textarea {
     font-size: 0.78rem;
     color: var(--muted);
 }
+/* chosen options in multi-selects: dark text on the lime tag, so it's readable */
+[data-testid="stMultiSelect"] [data-tag],
+[data-testid="stMultiSelect"] [data-tag] span,
+[data-testid="stMultiSelect"] [data-tag] button {
+    color: var(--bg) !important;
+    font-weight: 600;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -194,6 +203,18 @@ google_api_key = get_secret("GOOGLE_API_KEY")
 abstract_api_key = get_secret("ABSTRACT_API_KEY")
 ch_api_key = get_secret("COMPANIES_HOUSE_API_KEY")
 
+# your mailbox, for sending outreach emails (IONOS by default)
+mailbox = None
+if get_secret("SMTP_USER") and get_secret("SMTP_PASSWORD"):
+    mailbox = {
+        "host": get_secret("SMTP_HOST") or "smtp.ionos.co.uk",
+        "port": int(get_secret("SMTP_PORT") or 587),
+        "user": get_secret("SMTP_USER"),
+        "password": get_secret("SMTP_PASSWORD"),
+        "name": get_secret("SENDER_NAME") or "Pius Ajamma",
+        "imap_host": get_secret("IMAP_HOST") or "imap.ionos.co.uk",
+    }
+
 for key, default in {"results_df": None, "last_search": ("", ""), "closed_removed": 0}.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -206,7 +227,8 @@ GROUPS = [
 ]
 
 TABLE_COLUMNS = [
-    "name", "ok_to_email", "company_check", "phone", "website_status", "website", "email", "email_source",
+    "name", "ok_to_email", "company_check", "job_software", "vat_registered", "founded",
+    "phone", "website_status", "website", "email", "email_source",
     "email_check", "other_emails", "rating", "reviews", "address", "google_maps", "note",
 ]
 
@@ -241,6 +263,9 @@ def show_table(df):
             "name": "Business",
             "ok_to_email": "OK to email?",
             "company_check": "Companies House",
+            "job_software": "Job software",
+            "vat_registered": "VAT registered",
+            "founded": "Founded",
             "phone": "Phone",
             "website_status": "Website status",
             "website": st.column_config.LinkColumn("Website"),
@@ -329,96 +354,110 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not ch_api_key:
-    st.info(
-        "Add COMPANIES_HOUSE_API_KEY to .streamlit/secrets.toml (it's free) to search Companies House "
-        "and check which leads are limited companies. Only those can be cold emailed; sole traders "
-        "need consent first."
-    )
-
-with st.form("search", border=False):
-    source_label = st.radio("Where to search", list(SOURCES), horizontal=False)
-    st.caption(f"Trades it knows: {TRADE_LIST}. For Companies House you can also type SIC codes.")
-    c1, c2 = st.columns(2)
-    with c1:
-        trade = st.text_input("Trade", placeholder="Roofers, electricians, plumbers…")
-    with c2:
-        location = st.text_input("Town or postcode", placeholder="Wigan, Stockport, WN1…")
-    b1, b2 = st.columns([3, 1])
-    with b1:
-        submitted = st.form_submit_button("Find leads", type="primary", width="stretch")
-    with b2:
-        cleared = st.form_submit_button("Clear", type="secondary", width="stretch")
-
-if cleared:
-    st.session_state.results_df = None
-
-if submitted:
-    if not trade.strip() or not location.strip():
-        st.warning("Enter both a trade and a town.")
-    else:
-        result, closed = run_search(SOURCES[source_label], trade.strip(), location.strip())
-        if result is not None:
-            st.session_state.results_df = result
-            st.session_state.last_search = (trade.strip(), location.strip())
-            st.session_state.closed_removed = closed
-
-df = st.session_state.results_df
-
-if df is not None:
-    if df.empty:
-        st.info("No open businesses found for that search. Try a nearby town or a broader trade.")
-    else:
-        last_trade, last_loc = st.session_state.last_search
-        counts = {label: int(df["website_status"].isin(s).sum()) for label, s in GROUPS}
-        weak = counts["Social or directory"] + counts["Broken or holding"]
-        no_site_count = counts["No website"]
-        real_emails = int(((df["email"] != "") & (df["email_source"] != "Guessed")).sum())
-
-        st.markdown(f"""
-        <div class="stats">
-            <div class="stat"><div class="num">{len(df)}</div><div class="lbl">Businesses</div></div>
-            <div class="stat hot"><div class="num">{no_site_count}</div><div class="lbl">No website</div></div>
-            <div class="stat"><div class="num">{weak}</div><div class="lbl">Weak web presence</div></div>
-            <div class="stat"><div class="num">{real_emails}</div><div class="lbl">Emails found</div></div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown(
-            f'<div class="section-title">{html.escape(last_trade.title())} in {html.escape(last_loc.title())}</div>',
-            unsafe_allow_html=True,
+def find_page():
+    if not ch_api_key:
+        st.info(
+            "Add COMPANIES_HOUSE_API_KEY to .streamlit/secrets.toml (it's free) to search Companies House "
+            "and check which leads are limited companies. Only those can be cold emailed; sole traders "
+            "need consent first."
         )
-        st.markdown(
-            '<div class="section-sub">Sorted with the strongest prospects first. '
-            'Guessed emails are marked, so check them before sending.</div>',
-            unsafe_allow_html=True,
-        )
-        closed = st.session_state.closed_removed
-        if closed:
+
+    with st.form("search", border=False):
+        source_label = st.radio("Where to search", list(SOURCES), horizontal=False)
+        st.caption(f"Trades it knows: {TRADE_LIST}. For Companies House you can also type SIC codes.")
+        c1, c2 = st.columns(2)
+        with c1:
+            trade = st.text_input("Trade", placeholder="Roofers, electricians, plumbers…")
+        with c2:
+            location = st.text_input("Town or postcode", placeholder="Wigan, Stockport, WN1…")
+        b1, b2 = st.columns([3, 1])
+        with b1:
+            submitted = st.form_submit_button("Find leads", type="primary", width="stretch")
+        with b2:
+            cleared = st.form_submit_button("Clear", type="secondary", width="stretch")
+
+    if cleared:
+        st.session_state.results_df = None
+
+    if submitted:
+        if not trade.strip() or not location.strip():
+            st.warning("Enter both a trade and a town.")
+        else:
+            result, closed = run_search(SOURCES[source_label], trade.strip(), location.strip())
+            if result is not None:
+                st.session_state.results_df = result
+                st.session_state.last_search = (trade.strip(), location.strip())
+                st.session_state.closed_removed = closed
+
+    df = st.session_state.results_df
+
+    if df is not None:
+        if df.empty:
+            st.info("No open businesses found for that search. Try a nearby town or a broader trade.")
+        else:
+            last_trade, last_loc = st.session_state.last_search
+            counts = {label: int(df["website_status"].isin(s).sum()) for label, s in GROUPS}
+            weak = counts["Social or directory"] + counts["Broken or holding"]
+            no_site_count = counts["No website"]
+            real_emails = int(((df["email"] != "") & (df["email_source"] != "Guessed")).sum())
+
+            st.markdown(f"""
+            <div class="stats">
+                <div class="stat"><div class="num">{len(df)}</div><div class="lbl">Businesses</div></div>
+                <div class="stat hot"><div class="num">{no_site_count}</div><div class="lbl">No website</div></div>
+                <div class="stat"><div class="num">{weak}</div><div class="lbl">Weak web presence</div></div>
+                <div class="stat"><div class="num">{real_emails}</div><div class="lbl">Emails found</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+
             st.markdown(
-                f'<div class="note-line">{closed} permanently closed business{"es" if closed != 1 else ""} left out.</div>',
+                f'<div class="section-title">{html.escape(last_trade.title())} in {html.escape(last_loc.title())}</div>',
                 unsafe_allow_html=True,
             )
+            st.markdown(
+                '<div class="section-sub">Sorted with the strongest prospects first. '
+                'Guessed emails are marked, so check them before sending.</div>',
+                unsafe_allow_html=True,
+            )
+            closed = st.session_state.closed_removed
+            if closed:
+                st.markdown(
+                    f'<div class="note-line">{closed} permanently closed business{"es" if closed != 1 else ""} left out.</div>',
+                    unsafe_allow_html=True,
+                )
 
-        # hide sole traders and unknowns when you only want people you can email
-        only_ok = st.toggle("Only show limited companies I can email", value=False,
-                            disabled=not ch_api_key)
-        view = df[df["ok_to_email"] == "Yes"] if only_ok else df
+            # hide sole traders and unknowns when you only want people you can email
+            only_ok = st.toggle("Only show limited companies I can email", value=False,
+                                disabled=not ch_api_key)
+            view = df[df["ok_to_email"] == "Yes"] if only_ok else df
 
-        tabs = st.tabs([f"{label} · {int(view['website_status'].isin(s).sum())}" for label, s in GROUPS])
-        for tab, (label, statuses) in zip(tabs, GROUPS):
-            with tab:
-                part = view[view["website_status"].isin(statuses)]
-                if part.empty:
-                    st.caption("Nothing in this group.")
-                else:
-                    show_table(part)
+            tabs = st.tabs([f"{label} · {int(view['website_status'].isin(s).sum())}" for label, s in GROUPS])
+            for tab, (label, statuses) in zip(tabs, GROUPS):
+                with tab:
+                    part = view[view["website_status"].isin(statuses)]
+                    if part.empty:
+                        st.caption("Nothing in this group.")
+                    else:
+                        show_table(part)
 
-        slug = f"{re.sub(r'[^a-z0-9]+', '_', last_trade.lower())}_{re.sub(r'[^a-z0-9]+', '_', last_loc.lower())}"
-        st.download_button(
-            "Download all leads (.xlsx, one sheet per group)",
-            data=to_excel(df),
-            file_name=f"{slug}_leads.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-        )
+            slug = f"{re.sub(r'[^a-z0-9]+', '_', last_trade.lower())}_{re.sub(r'[^a-z0-9]+', '_', last_loc.lower())}"
+            st.download_button(
+                "Download all leads (.xlsx, one sheet per group)",
+                data=to_excel(df),
+                file_name=f"{slug}_leads.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+
+            save_panel(con, df, last_trade, last_loc, ch_api_key)
+
+
+# outreach lists live in a small database file on this computer (data/outreach.db)
+con = store.connect()
+
+page = st.radio("Page", ["Find leads", "My lists"], horizontal=True, key="page",
+                label_visibility="collapsed")
+if page == "Find leads":
+    find_page()
+else:
+    lists_page(con, ch_api_key, mailbox)

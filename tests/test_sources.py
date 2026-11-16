@@ -55,7 +55,8 @@ def test_match_score():
 def test_check_company_active_ltd_is_ok():
     s = FakeSession(FakeResponse(200, {"items": [ch_item("SMITH PLUMBING LTD")]}))
     out = check_company("Smith Plumbing", "Wigan WN1 2AB", "key", session=s)
-    assert out == {"company_check": "Ltd, active", "company_number": "01234567", "ok_to_email": "Yes"}
+    assert out == {"company_check": "Ltd, active", "company_number": "01234567", "ok_to_email": "Yes",
+                   "founded": ""}
 
 
 def test_check_company_not_found_is_not_ok():
@@ -157,7 +158,7 @@ def test_build_lead_uses_known_company_and_finds_site(monkeypatch):
     place = sources._place("ch:1", "Hartley Roofing Ltd", "Wigan WN1 2AB",
                            company={"company_check": "Ltd, active", "company_number": "1", "ok_to_email": "Yes"})
     monkeypatch.setattr(leads, "check_company", lambda *a: (_ for _ in ()).throw(AssertionError("no lookup")))
-    monkeypatch.setattr(leads, "find_website", lambda *a: "https://hartleyroofing.co.uk")
+    monkeypatch.setattr(leads, "find_website", lambda *a, **k: "https://hartleyroofing.co.uk")
     monkeypatch.setattr(leads, "analyse_website", lambda url: {"status": HAS_SITE, "url": url,
                         "domain": "hartleyroofing.co.uk", "emails": {"info@hartleyroofing.co.uk"}, "note": ""})
     row = leads.build_lead(place, "roofers", "Wigan", use_web_search=False)
@@ -219,7 +220,7 @@ def test_guess_website_rejects_a_page_about_someone_else():
 def test_no_email_guessing_when_no_site_was_found(monkeypatch):
     place = sources._place("ch:9", "Tate Security Technology Limited", "Wigan",
                            company={"company_check": "Ltd, active", "company_number": "9", "ok_to_email": "Yes"})
-    monkeypatch.setattr(leads, "find_website", lambda *a: "")
+    monkeypatch.setattr(leads, "find_website", lambda *a, **k: "")
     monkeypatch.setattr(leads, "search_emails_online",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not search")))
     row = leads.build_lead(place, "electricians", "Wigan")
@@ -239,10 +240,25 @@ def test_short_guess_needs_the_town():
 def test_business_email_beats_web_designer_email(monkeypatch):
     place = sources._place("ch:5", "Journey Electrical Ltd", "Wigan",
                            company={"company_check": "Ltd, active", "company_number": "5", "ok_to_email": "Yes"})
-    monkeypatch.setattr(leads, "find_website", lambda *a: "https://journeyelectrical.co.uk")
+    monkeypatch.setattr(leads, "find_website", lambda *a, **k: "https://journeyelectrical.co.uk")
     monkeypatch.setattr(leads, "analyse_website", lambda url: {
         "status": HAS_SITE, "url": url, "domain": "journeyelectrical.co.uk", "note": "",
         "emails": {"info.tisodigital@gmail.com", "journey.electrical.service@gmail.com"}})
     monkeypatch.setattr(leads, "check_email", lambda e, a=None: "ok")
     row = leads.build_lead(place, "electricians", "Wigan", use_web_search=False)
     assert row["email"] == "journey.electrical.service@gmail.com"
+
+
+def test_short_guess_accepts_the_company_area():
+    # bmfire.co.uk is short for "Bm Fire And Security"; the page names Standish, from its address
+    s = PageSession({"https://bmfire.co.uk": Page("BM Fire: fire alarms and CCTV in Standish")})
+    assert guess_website("Bm Fire And Security Ltd", "electricians", "Wigan", session=s,
+                         address="39 Broomfield Road, Standish, Wigan, WN6 0LY") == "https://bmfire.co.uk"
+    # or a town from its registered address (Bolton), not the search town
+    s = PageSession({"https://chorrocks.co.uk": Page("C Horrocks and Sons, electrical contractors in Bolton since 1963")})
+    assert guess_website("C.Horrocks & Sons Limited", "electricians", "Wigan", session=s,
+                         address="423 Wigan Road, Bolton, BL3 4QJ") == "https://chorrocks.co.uk"
+    # a generic leftover word ("installations") proves nothing
+    s = PageSession({"https://positivepower.com": Page("Positive Power installations worldwide")})
+    assert guess_website("Positive Power Installations Limited", "electricians", "Wigan", session=s,
+                         address="41 Bridgeman Terrace, Wigan, WN1 1TT") == ""

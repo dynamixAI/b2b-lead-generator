@@ -80,7 +80,35 @@ def _page_mentions(text, name, trade, location):
     return found >= 1 and bool(location) and location.lower() in text
 
 
-def guess_website(name, trade="", location="", session=None):
+# words too common to prove a page belongs to one business
+GENERIC_WORDS = {"services", "solutions", "systems", "group", "contractors", "contracting", "installations",
+                 "electrical", "electrics", "building", "builders", "developments", "energy", "power", "sons",
+                 "property", "maintenance", "projects", "uk", "nw", "north", "west"}
+
+
+def places_in(address):
+    # town and district names from an address, plus the postcode's first half: "WN6", "Standish", "Wigan"
+    parts = [p.strip().lower() for p in (address or "").split(",")[1:]]
+    places = {p for p in parts if p and not re.search(r"\d", p) and len(p) > 2}
+    outward = re.findall(r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*\d[A-Z]{2}\b", (address or "").upper())
+    return places | {o.lower() for o in outward}
+
+
+def _short_guess_ok(text, name, location, address):
+    # a shortened guess (homeimprovement.co.uk) needs more proof: the town, a place from
+    # the company's address, or the part of its name the guess left out
+    text = text.lower()
+    if location and location.lower() in text:
+        return True
+    if any(p in text for p in places_in(address)):
+        return True
+    clean = re.sub(r"\(.*?\)", " ", (name or "").lower()).replace("&", " ")
+    words = [w for w in re.findall(r"[a-z0-9]+", clean) if w not in LEGAL_WORDS]
+    rest = [w for w in words[2:] if len(w) >= 4 and w not in GENERIC_WORDS]
+    return any(w in text for w in rest)
+
+
+def guess_website(name, trade="", location="", session=None, address=""):
     get = (session or requests).get
     full = set(guess_domains(name, with_short=False))
     for domain in guess_domains(name):
@@ -101,11 +129,11 @@ def guess_website(name, trade="", location="", session=None):
             text = visible_text(r.text)
             if is_holding_page(text) or not _page_mentions(text, name, trade, location):
                 break
-            if short and not (location and location.lower() in text.lower()):
+            if short and not _short_guess_ok(text, name, location, address):
                 break
             return scheme + domain
     return ""
 
 
-def find_website(name, location, trade="", session=None):
-    return guess_website(name, trade, location, session)
+def find_website(name, location, trade="", session=None, address=""):
+    return guess_website(name, trade, location, session, address)

@@ -1,4 +1,5 @@
 import urllib.parse
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.companies import check_company
@@ -14,6 +15,7 @@ COLUMNS = [
     "name", "phone", "website_status", "website", "email", "email_source",
     "email_check", "other_emails", "rating", "reviews", "address",
     "google_maps", "ok_to_email", "company_check", "company_number",
+    "job_software", "vat_registered", "founded", "tradereports_fit",
     "note", "lat", "lng", "place_id",
 ]
 
@@ -45,6 +47,10 @@ def base_row(place):
         "ok_to_email": "",
         "company_check": "",
         "company_number": "",
+        "job_software": "",
+        "vat_registered": "",
+        "founded": "",
+        "tradereports_fit": "",
         "note": note,
         "lat": loc.get("latitude"),
         "lng": loc.get("longitude"),
@@ -58,11 +64,14 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_ke
     # (Companies House results already know, so no second lookup)
     row.update(place.get("_company") or check_company(row["name"], row["address"], ch_key))
     if not row["website"] and place.get("_find_site"):
-        row["website"] = find_website(row["name"], location, trade)
+        row["website"] = find_website(row["name"], location, trade, address=row["address"])
         found = "Website found automatically, check it's theirs" if row["website"] else "No website found online"
         row["note"] = "; ".join(filter(None, [row["note"], found]))
     site = analyse_website(row["website"])
     row["website_status"] = site["status"]
+    row["job_software"] = ", ".join(site.get("software", []))
+    row["vat_registered"] = "Yes" if site.get("vat") else ""
+    row["tradereports_fit"] = tradereports_fit(row)
     row["website"] = strip_tracking(site["url"])
     if site["note"]:
         row["note"] = "; ".join(filter(None, [row["note"], site["note"]]))
@@ -97,6 +106,29 @@ def build_lead(place, trade, location, abstract=None, use_web_search=True, ch_ke
         row["other_emails"] = ", ".join(emails[1:4])
         row["email_check"] = check_email(emails[0], abstract)
     return row
+
+
+def years_trading(founded, today=None):
+    try:
+        start = date.fromisoformat(str(founded)[:10])
+    except ValueError:
+        return None
+    today = today or date.today()
+    return today.year - start.year - ((today.month, today.day) < (start.month, start.day))
+
+
+def tradereports_fit(row, today=None):
+    """How likely TradeReports is to help: High, Medium or Low.
+
+    High: their site shows job software (they have exports to check).
+    Medium: VAT registered, or trading 2+ years with a working website.
+    """
+    if row.get("job_software"):
+        return "High"
+    years = years_trading(row.get("founded", ""), today)
+    if row.get("vat_registered") == "Yes" or (years is not None and years >= 2 and row.get("website_status") == HAS_SITE):
+        return "Medium"
+    return "Low"
 
 
 def is_closed(place):

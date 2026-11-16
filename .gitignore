@@ -2,3 +2,6 @@
 .venv/
 __pycache__/
 .pytest_cache/
+
+# outreach lists (business contacts, keep private)
+data/
