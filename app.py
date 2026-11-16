@@ -8,6 +8,7 @@ import streamlit as st
 from core.emails import AbstractChecker
 from core.leads import COLUMNS, build_leads, is_closed
 from core.places import PlacesError, search_places
+from core.sources import TRADE_LIST, SourceError, resolve_trade, search_companies_house, search_osm
 from core.website import BROKEN, HAS_SITE, HOLDING, NO_SITE, SOCIAL
 
 st.set_page_config(
@@ -191,6 +192,7 @@ def get_secret(name):
 
 google_api_key = get_secret("GOOGLE_API_KEY")
 abstract_api_key = get_secret("ABSTRACT_API_KEY")
+ch_api_key = get_secret("COMPANIES_HOUSE_API_KEY")
 
 for key, default in {"results_df": None, "last_search": ("", ""), "closed_removed": 0}.items():
     if key not in st.session_state:
@@ -204,7 +206,7 @@ GROUPS = [
 ]
 
 TABLE_COLUMNS = [
-    "name", "phone", "website_status", "website", "email", "email_source",
+    "name", "ok_to_email", "company_check", "phone", "website_status", "website", "email", "email_source",
     "email_check", "other_emails", "rating", "reviews", "address", "google_maps", "note",
 ]
 
@@ -216,6 +218,10 @@ def to_excel(df):
         for label, statuses in GROUPS:
             part = df[df["website_status"].isin(statuses)]
             part.drop(columns=["lat", "lng", "place_id"]).to_excel(writer, sheet_name=label, index=False)
+        # companies you can cold email (active Ltd or LLP)
+        ok = df[df["ok_to_email"] == "Yes"]
+        if not ok.empty:
+            ok.drop(columns=["lat", "lng", "place_id"]).to_excel(writer, sheet_name="OK to email", index=False)
     return output.getvalue()
 
 
@@ -233,6 +239,8 @@ def show_table(df):
         column_order=columns,
         column_config={
             "name": "Business",
+            "ok_to_email": "OK to email?",
+            "company_check": "Companies House",
             "phone": "Phone",
             "website_status": "Website status",
             "website": st.column_config.LinkColumn("Website"),
@@ -249,19 +257,41 @@ def show_table(df):
     )
 
 
-def run_search(trade, location):
-    query = f"{trade} in {location}, UK"
+SOURCES = {
+    "Companies House (free, limited companies only)": "ch",
+    "OpenStreetMap (free, any business, patchy)": "osm",
+    "Google Places (needs a Google key)": "google",
+}
+
+
+def find_places(source, trade, location):
+    # returns a list of place dicts from the chosen source
+    if source == "google":
+        if not google_api_key:
+            raise SourceError("No Google key. Add GOOGLE_API_KEY to .streamlit/secrets.toml, or pick a free source.")
+        try:
+            return search_places(f"{trade} in {location}, UK", google_api_key)
+        except PlacesError as e:
+            raise SourceError(f"Google Places: {e}")
+    sic, tags = resolve_trade(trade)
+    if source == "ch":
+        return search_companies_house(sic, location, ch_api_key)
+    return search_osm(tags, location)
+
+
+def run_search(source, trade, location):
     status = st.empty()
+    names = {"ch": "Companies House", "osm": "OpenStreetMap", "google": "Google Places"}
     status.markdown(
-        f'<div class="status-line">Searching Google Places for "{html.escape(query)}"…</div>',
+        f'<div class="status-line">Searching {names[source]} for {html.escape(trade)} in {html.escape(location)}…</div>',
         unsafe_allow_html=True,
     )
 
     try:
-        places = search_places(query, google_api_key)
-    except PlacesError as e:
+        places = find_places(source, trade, location)
+    except SourceError as e:
         status.empty()
-        st.error(f"Google Places: {e}")
+        st.error(str(e))
         return None, 0
 
     open_places = [p for p in places if not is_closed(p)]
@@ -280,7 +310,8 @@ def run_search(trade, location):
         )
 
     abstract = AbstractChecker(abstract_api_key) if abstract_api_key else None
-    rows = build_leads(open_places, trade, location, abstract=abstract, on_progress=on_progress)
+    rows = build_leads(open_places, trade, location, abstract=abstract,
+                      on_progress=on_progress, ch_key=ch_api_key)
 
     status.empty()
     progress.empty()
@@ -298,11 +329,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not google_api_key:
-    st.error("No Google API key found. Add GOOGLE_API_KEY to .streamlit/secrets.toml and restart the app.")
-    st.stop()
+if not ch_api_key:
+    st.info(
+        "Add COMPANIES_HOUSE_API_KEY to .streamlit/secrets.toml (it's free) to search Companies House "
+        "and check which leads are limited companies. Only those can be cold emailed; sole traders "
+        "need consent first."
+    )
 
 with st.form("search", border=False):
+    source_label = st.radio("Where to search", list(SOURCES), horizontal=False)
+    st.caption(f"Trades it knows: {TRADE_LIST}. For Companies House you can also type SIC codes.")
     c1, c2 = st.columns(2)
     with c1:
         trade = st.text_input("Trade", placeholder="Roofers, electricians, plumbers…")
@@ -321,7 +357,7 @@ if submitted:
     if not trade.strip() or not location.strip():
         st.warning("Enter both a trade and a town.")
     else:
-        result, closed = run_search(trade.strip(), location.strip())
+        result, closed = run_search(SOURCES[source_label], trade.strip(), location.strip())
         if result is not None:
             st.session_state.results_df = result
             st.session_state.last_search = (trade.strip(), location.strip())
@@ -364,10 +400,15 @@ if df is not None:
                 unsafe_allow_html=True,
             )
 
-        tabs = st.tabs([f"{label} · {counts[label]}" for label, _ in GROUPS])
+        # hide sole traders and unknowns when you only want people you can email
+        only_ok = st.toggle("Only show limited companies I can email", value=False,
+                            disabled=not ch_api_key)
+        view = df[df["ok_to_email"] == "Yes"] if only_ok else df
+
+        tabs = st.tabs([f"{label} · {int(view['website_status'].isin(s).sum())}" for label, s in GROUPS])
         for tab, (label, statuses) in zip(tabs, GROUPS):
             with tab:
-                part = df[df["website_status"].isin(statuses)]
+                part = view[view["website_status"].isin(statuses)]
                 if part.empty:
                     st.caption("Nothing in this group.")
                 else:
