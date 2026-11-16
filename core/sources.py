@@ -137,6 +137,7 @@ def search_companies_house(sic_codes, location, api_key, max_results=100, sessio
                     "company_check": f"{'LLP' if kind == 'llp' else 'Ltd'}, active",
                     "company_number": item.get("company_number", ""),
                     "ok_to_email": "Yes",
+                    "founded": item.get("date_of_creation", ""),
                 },
             ))
         if len(items) < params["size"]:
