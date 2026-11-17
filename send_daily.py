@@ -115,7 +115,7 @@ def send_lists(con, lists, args, box, send, sender):
     try:
         counts = check_replies(con, box["imap_host"], box["user"], box["password"], on_event=log)
         log(f"Inbox checked: {counts['opted_out']} opted out, {counts['interested']} said yes, "
-            f"{counts['replied']} replied.")
+            f"{counts['replied']} replied, {counts['bounced']} bounced.")
     except Exception as e:
         log(f"Couldn't read your inbox ({e}), so nothing was sent today, to be safe.")
         return 1

@@ -119,6 +119,13 @@ def domains_match(email_domain, site_domain):
     )
 
 
+def is_personal(email):
+    # craig@ or adrian.barnett@ is a person; info@ or office@ is a shared inbox
+    from core.mailer import GENERIC_BOXES, is_first_name
+    first = re.split(r"[._\-+0-9]", email.split("@", 1)[0].lower())[0]
+    return bool(first) and first not in GENERIC_BOXES and is_first_name(first)
+
+
 def rank_emails(emails, site_domain=None):
     def key(e):
         domain = e.split("@", 1)[1]
@@ -128,7 +135,8 @@ def rank_emails(emails, site_domain=None):
             group = 1
         else:
             group = 2
-        return (group, len(e), e)
+        # a named person's address first: it reaches someone, and greets them by name
+        return (group, 0 if is_personal(e) else 1, len(e), e)
     return sorted(set(emails), key=key)
 
 

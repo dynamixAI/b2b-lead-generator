@@ -245,7 +245,8 @@ def lists_page(con, ch_api_key, mailbox=None):
         key=editor_key,
         hide_index=True,
         width="stretch",
-        column_order=["name", "contact_by", "status", "date_contacted", "follow_up", "notes", "email", "phone",
+        column_order=["name", "contact_by", "status", "date_contacted", "follow_up", "notes", "email",
+                      "email_source", "phone",
                       "director", "address", "flags", "facebook", "google", "website", "grp", "founded",
                       "job_software", "vat_registered", "other_emails", "company_number"],
         disabled=[c for c in view.columns if c not in ("status", "date_contacted", "notes")],
@@ -258,6 +259,8 @@ def lists_page(con, ch_api_key, mailbox=None):
             "follow_up": st.column_config.DateColumn("Follow up on", format="D MMM YYYY"),
             "notes": st.column_config.TextColumn("Notes", width="medium"),
             "email": "Email",
+            "email_source": st.column_config.TextColumn(
+                "Email from", help="Guessed addresses (info@ + their website) are never emailed automatically"),
             "phone": "Phone",
             "director": "Director",
             "address": "Address",
@@ -394,7 +397,7 @@ def email_section(con, list_id, info, mailbox):
                 counts = check_replies(con, mailbox.get("imap_host", "imap.ionos.co.uk"), mailbox["user"],
                                        mailbox["password"], on_event=events.append)
                 st.success(f"{counts['opted_out']} opted out, {counts['interested']} said yes, "
-                           f"{counts['replied']} replied." + ("  \n" + "  \n".join(events) if events else ""))
+                           f"{counts['replied']} replied, {counts['bounced']} bounced." + ("  \n" + "  \n".join(events) if events else ""))
                 st.session_state[f"lists_version_{list_id}"] = st.session_state.get(f"lists_version_{list_id}", 0) + 1
             except Exception as e:
                 st.error(f"Couldn't read your inbox: {e}")
