@@ -108,6 +108,23 @@ def _short_guess_ok(text, name, location, address):
     return any(w in text for w in rest)
 
 
+UK_POSTCODE = re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b")
+UK_PHONE = re.compile(r"(\+44|\b0[1237]\d{2,3})[\s-]?\d{3,4}[\s-]?\d{3,4}\b")
+
+
+def has_uk_sign(text, location="", address=""):
+    """A UK postcode, a UK phone number, the town or a place from the address.
+    powerplussystems.com matched a Wigan company's name but was a firm in India."""
+    if UK_POSTCODE.search(text.upper()) or UK_PHONE.search(text):
+        return True
+    low = text.lower()
+    if re.search(r"\b(united kingdom|england|uk)\b", low):
+        return True
+    if location and location.lower() in low:
+        return True
+    return any(p in low for p in places_in(address))
+
+
 def guess_website(name, trade="", location="", session=None, address=""):
     get = (session or requests).get
     full = set(guess_domains(name, with_short=False))
@@ -130,6 +147,9 @@ def guess_website(name, trade="", location="", session=None, address=""):
             if is_holding_page(text) or not _page_mentions(text, name, trade, location):
                 break
             if short and not _short_guess_ok(text, name, location, address):
+                break
+            # .co.uk and .uk are UK by definition; a .com has to show it
+            if not domain.endswith(".uk") and not has_uk_sign(text, location, address):
                 break
             return scheme + domain
     return ""

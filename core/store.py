@@ -14,7 +14,8 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("OUTREACH_DB") or Path(__file__).resolve().parent.parent / "data" / "outreach.db")
 
 PURPOSES = ["Web design", "TradeReports", "Data service", "Other"]
-STATUSES = ["Not contacted", "Contacted", "Followed up", "Replied", "Interested", "Not interested", "Opted out"]
+STATUSES = ["Not contacted", "Contacted", "Followed up", "Replied", "Interested", "Not interested", "Opted out",
+            "Bad email"]
 FOLLOW_UP_DAYS = 7
 
 # what the app's website statuses mean for outreach
@@ -95,7 +96,7 @@ LEAD_COLUMNS = [
     "id", "name", "grp", "contact_by", "email", "phone", "director", "address", "status",
     "date_contacted", "notes", "website", "other_emails", "company_number", "ok_to_email",
     "trade", "town", "added", "job_software", "vat_registered", "founded", "tradereports_fit",
-    "follow_up_sent",
+    "follow_up_sent", "email_source",
 ]
 
 # when a list sends by itself: send_time (HH:MM) on weekdays when auto_send is on,
@@ -105,7 +106,7 @@ DEFAULT_SEND_TIME = "08:45"
 LATE_HOURS = 3   # laptop asleep at the time: still send if it wakes within this many hours
 
 # columns added after the first version; older databases get them on connect
-NEW_COLUMNS = ["job_software", "vat_registered", "founded", "tradereports_fit", "follow_up_sent"]
+NEW_COLUMNS = ["job_software", "vat_registered", "founded", "tradereports_fit", "follow_up_sent", "email_source"]
 
 
 def connect(path=None):
@@ -217,8 +218,8 @@ def add_leads(con, list_id, rows, trade="", town="", directors=None):
             con.execute("""
                 INSERT INTO leads (list_id, key, name, grp, contact_by, email, other_emails, phone,
                     director, address, website, company_number, ok_to_email, trade, town,
-                    job_software, vat_registered, founded, tradereports_fit, status, added)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    job_software, vat_registered, founded, tradereports_fit, status, added, email_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 list_id, key, row.get("name", ""), group_of(row.get("website_status", "")),
                 contact_route(row), email, row.get("other_emails", ""), row.get("phone", ""),
@@ -226,7 +227,7 @@ def add_leads(con, list_id, rows, trade="", town="", directors=None):
                 row.get("company_number", ""), row.get("ok_to_email", ""), trade, town,
                 row.get("job_software", ""), row.get("vat_registered", ""), row.get("founded", ""),
                 row.get("tradereports_fit", ""),
-                "Opted out" if is_out else "Not contacted", today,
+                "Opted out" if is_out else "Not contacted", today, row.get("email_source", ""),
             ))
         except sqlite3.IntegrityError:
             already += 1
@@ -352,7 +353,9 @@ def due_first_emails(con, list_id, limit, today=None):
     out_keys, out_emails = opted_out_keys(con)
     recent_keys, recent_emails = _recently_emailed(con, today)
     rows = con.execute("""SELECT * FROM leads WHERE list_id = ? AND status = 'Not contacted'
-                          AND email != '' AND ok_to_email = 'Yes' ORDER BY id""", (list_id,)).fetchall()
+                          AND email != '' AND ok_to_email = 'Yes'
+                          AND IFNULL(email_source, '') NOT IN ('Guessed', 'Wrong site')
+                          ORDER BY id""", (list_id,)).fetchall()
     due = []
     for r in rows:
         email = r["email"].lower()

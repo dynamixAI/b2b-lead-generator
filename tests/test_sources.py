@@ -262,3 +262,16 @@ def test_short_guess_accepts_the_company_area():
     s = PageSession({"https://positivepower.com": Page("Positive Power installations worldwide")})
     assert guess_website("Positive Power Installations Limited", "electricians", "Wigan", session=s,
                          address="41 Bridgeman Terrace, Wigan, WN1 1TT") == ""
+
+
+def test_com_site_must_be_in_the_uk():
+    # powerplussystems.com: the right name, but a company in India
+    india = Page("Power Plus Systems. Kattuparambil Building, Aluva, Cochin, Kottayam 686001. 884 864 13 17")
+    s = PageSession({"https://powerplussystems.com": india})
+    assert guess_website("Power Plus Systems Ltd", "electricians", "Wigan", session=s,
+                         address="1 Market St, Wigan, WN1 1AA") == ""
+    # the same name with a UK postcode on the page is fine
+    uk = Page("Power Plus Systems, electrical contractors, Unit 4, Wigan WN5 0AB")
+    s = PageSession({"https://powerplussystems.com": uk})
+    assert guess_website("Power Plus Systems Ltd", "electricians", "Wigan", session=s) == \
+        "https://powerplussystems.com"

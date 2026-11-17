@@ -161,7 +161,7 @@ def test_send_daily_script(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(send_daily, "smtp_sender", lambda *a: sent.append)
     monkeypatch.setattr(sendqueue.time, "sleep", lambda s: None)
-    monkeypatch.setattr(send_daily, "check_replies", lambda *a, **k: {"opted_out": 0, "interested": 0, "replied": 0})
+    monkeypatch.setattr(send_daily, "check_replies", lambda *a, **k: {"opted_out": 0, "interested": 0, "replied": 0, "bounced": 0})
 
     con = store.connect()
     lid = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
@@ -338,7 +338,7 @@ def test_check_replies_reads_the_inbox_without_changing_it(con):
 
     imap = FakeImap()
     counts = check_replies(con, "imap.x", "pius@tradereports.co.uk", "pw", connect=lambda: imap)
-    assert counts == {"opted_out": 1, "interested": 0, "replied": 0}
+    assert counts == {"opted_out": 1, "interested": 0, "replied": 0, "bounced": 0}
     assert ("select", True) in imap.calls and "(BODY.PEEK[])" in imap.calls  # read-only, stays unread
     assert imap.calls[-1] == "logout"
     assert store.load_leads(con, lid)[0]["status"] == "Opted out"
@@ -387,7 +387,7 @@ def test_timer_sends_only_lists_that_are_due(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(send_daily, "smtp_sender", lambda *a: sent.append)
     monkeypatch.setattr(sendqueue.time, "sleep", lambda s: None)
-    monkeypatch.setattr(send_daily, "check_replies", lambda *a, **k: {"opted_out": 0, "interested": 0, "replied": 0})
+    monkeypatch.setattr(send_daily, "check_replies", lambda *a, **k: {"opted_out": 0, "interested": 0, "replied": 0, "bounced": 0})
 
     con = store.connect()
     due = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
@@ -402,3 +402,97 @@ def test_timer_sends_only_lists_that_are_due(tmp_path, monkeypatch):
     # it doesn't run again on the next tick
     sent.clear()
     assert send_daily.main(["--gap", "0"]) == 0 and sent == []
+
+
+# --- bounced emails and guessed addresses ---
+
+GMAIL_BOUNCE = """Address not found
+Your message wasn't delivered to info@wiswellbuilding.co.uk because the address couldn't be found, or is unable to receive mail.
+The response was:
+The email account that you tried to reach does not exist."""
+
+EXIM_BOUNCE = """The following recipient address(es) could not be reached:
+* info@powerplussystems.com
+Technical details:
+- Error message for [info@powerplussystems.com]
+    SMTP error from remote server for RCPT TO command: 550 No Such User Here"""
+
+
+def test_bounces_mark_bad_email_everywhere(con):
+    from core.inbox import handle_message
+    web = make_list(con, [lead("Wiswell Ltd", "info@wiswellbuilding.co.uk", "1"),
+                          lead("Power Plus Ltd", "info@powerplussystems.com", "2"),
+                          lead("Fine Ltd", "jo@fine.co.uk", "3")], purpose="Web design")
+    tr = make_list(con, [lead("Wiswell Ltd", "info@wiswellbuilding.co.uk", "1")], purpose="TradeReports")
+    sendqueue.run(con, web, SENDER, lambda m: None, limit=5, sleep=lambda s: None)
+
+    gmail = reply("mailer-daemon@googlemail.com", "Delivery Status Notification (Failure)", GMAIL_BOUNCE)
+    assert handle_message(con, gmail, SENDER["email"]) == ("bounced", ["Wiswell Ltd"])
+    exim = reply("noreply@mail.example.net", "Your email could not be delivered", EXIM_BOUNCE)
+    assert handle_message(con, exim, SENDER["email"]) == ("bounced", ["Power Plus Ltd"])
+
+    status = {l["name"]: l["status"] for l in store.load_leads(con, web)}
+    assert status == {"Wiswell Ltd": "Bad email", "Power Plus Ltd": "Bad email", "Fine Ltd": "Contacted"}
+    assert "bounced" in store.load_leads(con, web)[0]["notes"]
+    # never emailed again: no follow-up, and not from the other list either
+    assert [l["name"] for l in store.due_follow_ups(con, web, date.today() + timedelta(days=8))] == ["Fine Ltd"]
+    assert store.load_leads(con, tr)[0]["status"] == "Bad email"
+    assert store.due_first_emails(con, tr, 5, date.today() + timedelta(days=60)) == []
+
+
+def test_bounce_for_someone_never_emailed_changes_nothing(con):
+    from core.inbox import handle_message
+    lid = make_list(con, [lead("A Ltd", "a@a.co.uk", "1")])
+    m = reply("mailer-daemon@x.com", "Undeliverable: hello", "a@a.co.uk could not be delivered")
+    assert handle_message(con, m, SENDER["email"]) is None  # A was never sent anything
+    assert store.load_leads(con, lid)[0]["status"] == "Not contacted"
+
+
+def test_guessed_addresses_are_not_emailed(con):
+    guessed = dict(lead("Guess Ltd", "info@guess.co.uk", "1"), email_source="Guessed")
+    found = dict(lead("Found Ltd", "jo@found.co.uk", "2"), email_source="Website")
+    lid = make_list(con, [guessed, found])
+    assert [l["name"] for l in store.due_first_emails(con, lid, 5)] == ["Found Ltd"]
+    assert {l["name"]: l["email_source"] for l in store.load_leads(con, lid)} == \
+        {"Guess Ltd": "Guessed", "Found Ltd": "Website"}
+
+
+def test_named_person_beats_info():
+    from core.emails import rank_emails
+    emails = ["info@wiswellbuilding.co.uk", "craig@wiswellbuilding.co.uk", "accounts@wiswellbuilding.co.uk"]
+    assert rank_emails(emails, "wiswellbuilding.co.uk")[0] == "craig@wiswellbuilding.co.uk"
+    # the business's own domain still comes before a gmail address
+    assert rank_emails(["sam@gmail.com", "info@x.co.uk"], "x.co.uk")[0] == "info@x.co.uk"
+
+
+def test_bounce_switches_to_the_next_address(con):
+    from core.inbox import handle_message
+    w = dict(lead("Wiswell Ltd", "info@wiswellbuilding.co.uk", "1"), other_emails="craig@wiswellbuilding.co.uk")
+    lid = make_list(con, [w])
+    sendqueue.run(con, lid, SENDER, lambda m: None, limit=5, sleep=lambda s: None)
+    gmail = reply("mailer-daemon@googlemail.com", "Delivery Status Notification (Failure)", GMAIL_BOUNCE)
+    assert handle_message(con, gmail, SENDER["email"]) == ("bounced", ["Wiswell Ltd"])
+    l = store.load_leads(con, lid)[0]
+    assert (l["email"], l["status"], l["other_emails"]) == ("craig@wiswellbuilding.co.uk", "Not contacted", "")
+    assert "switched to craig@" in l["notes"]
+    # the bounce didn't count as contact, so craig@ can be emailed straight away
+    sent = []
+    sendqueue.run(con, lid, SENDER, sent.append, limit=5, sleep=lambda s: None)
+    assert [m["To"] for m in sent] == ["craig@wiswellbuilding.co.uk"]
+
+
+def test_dead_domain_doesnt_try_the_same_domain(con):
+    from core.inbox import handle_message
+    w = dict(lead("Gone Ltd", "info@gone.co.uk", "1"), other_emails="sam@gone.co.uk, gone.ltd@gmail.com")
+    lid = make_list(con, [w])
+    sendqueue.run(con, lid, SENDER, lambda m: None, limit=5, sleep=lambda s: None)
+    bounce = reply("mailer-daemon@ionos.co.uk", "Mail delivery failed",
+                   "info@gone.co.uk\nHost or domain name not found. Name service error for name=gone.co.uk")
+    assert handle_message(con, bounce, SENDER["email"]) == ("bounced", ["Gone Ltd"])
+    assert store.load_leads(con, lid)[0]["email"] == "gone.ltd@gmail.com"   # not sam@gone.co.uk
+
+
+def test_wrong_site_leads_are_not_emailed(con):
+    wrong = dict(lead("Abroad Ltd", "info@abroad.com", "1"), email_source="Wrong site")
+    lid = make_list(con, [wrong])
+    assert store.due_first_emails(con, lid, 5) == []

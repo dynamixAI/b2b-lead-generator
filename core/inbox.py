@@ -3,8 +3,9 @@
   - "Unsubscribe", "no thanks", "remove me" and the like -> Opted out, in every list
   - a "Yes please" from one of the email's buttons    -> Interested
   - any other reply                                    -> Replied (so no follow-up goes out)
+  - "address not found" bounces                        -> Bad email, in every list (never emailed again)
 
-Out-of-office and bounce messages are ignored. It only reads; nothing in your inbox changes,
+Out-of-office messages are ignored. It only reads; nothing in your inbox changes,
 and emails stay unread.
 """
 import email
@@ -26,6 +27,13 @@ STOP_WORDS = re.compile(
 AUTO_SUBJECT = re.compile(
     r"out of (?:the )?office|automatic reply|auto.?reply|autoreply|away from|on holiday|annual leave|"
     r"undeliver|delivery status|delivery failure|returned mail|mail delivery", re.I)
+BOUNCE_SUBJECT = re.compile(
+    r"undeliver|delivery status notification|delivery failure|failure notice|returned mail|"
+    r"mail delivery|address not found|could not be delivered|wasn't delivered|not delivered", re.I)
+DOMAIN_DEAD = re.compile(
+    r"domain not found|host not found|no such domain|host or domain name not found|nxdomain|"
+    r"unrouteable|unroutable|dns error|domain does not exist", re.I)
+EMAIL_IN_TEXT = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 QUOTE_START = re.compile(
     r"^\s*(>|on .{5,200}wrote:|-{2,}\s*original message|from:\s|sent from my|_{5,})", re.I)
 
@@ -76,6 +84,60 @@ def _is_automatic(msg, from_email):
     return bool(AUTO_SUBJECT.search(msg.get("Subject") or ""))
 
 
+def _is_bounce(msg, from_email):
+    if re.match(r"(mailer-daemon|postmaster)@", from_email):
+        return True
+    if msg.get_content_type() == "multipart/report":
+        return True
+    return bool(BOUNCE_SUBJECT.search(msg.get("Subject") or ""))
+
+
+def bounced_addresses(con, msg):
+    """Addresses in a bounce that you actually emailed (from the send log)."""
+    try:
+        raw = msg.as_bytes().decode("utf-8", "ignore")
+    except Exception:
+        raw = str(msg.get_payload())
+    found = {e.lower().rstrip(".") for e in EMAIL_IN_TEXT.findall(raw)}
+    if not found:
+        return []
+    marks = ",".join("?" * len(found))
+    rows = con.execute(f"SELECT DISTINCT lower(email) AS e FROM send_log WHERE ok = 1 AND lower(email) IN ({marks})",
+                       tuple(found))
+    return sorted(r["e"] for r in rows)
+
+
+def _mark_bounced(con, addresses, day, domain_dead=False):
+    names = []
+    for address in addresses:
+        # it never arrived, so it doesn't count as contacting them
+        con.execute("UPDATE send_log SET ok = 0, error = 'bounced' WHERE lower(email) = ?", (address,))
+        for lead in con.execute("SELECT * FROM leads WHERE lower(email) = ?", (address,)).fetchall():
+            lead = dict(lead)
+            if lead["status"] in ("Opted out", "Bad email"):
+                continue
+            tried = {r["e"] for r in con.execute(
+                "SELECT DISTINCT lower(email) AS e FROM send_log WHERE lead_key = ?", (lead["key"],))} | {address}
+            others = [e.strip().lower() for e in (lead["other_emails"] or "").split(",") if e.strip()]
+            if domain_dead:
+                # the whole domain is gone: only an address somewhere else could work
+                dead = address.split("@")[1]
+                others = [e for e in others if e.split("@")[-1] != dead]
+            nxt = next((e for e in others if e not in tried), "")
+            if nxt:
+                # another address on their website: use that one next time instead
+                rest = ", ".join(e for e in others if e != nxt)
+                con.execute("""UPDATE leads SET email = ?, other_emails = ?, status = 'Not contacted',
+                               date_contacted = '', follow_up_sent = '' WHERE id = ?""", (nxt, rest, lead["id"]))
+                con.commit()
+                _add_note(con, lead, f"{day}: {address} bounced, switched to {nxt}")
+            else:
+                store.update_lead(con, lead["id"], status="Bad email")
+                _add_note(con, lead, f"{day}: email bounced, {address} doesn't exist")
+            names.append(lead["name"])
+    return sorted(set(names))
+
+
 def _message_id(msg):
     mid = (msg.get("Message-ID") or "").strip()
     if mid:
@@ -97,6 +159,14 @@ def handle_message(con, msg, own_address, today=None):
         return None
     store.mark_seen(con, mid)
     from_email = parseaddr(msg.get("From") or "")[1].strip().lower()
+    day = (today or date.today()).strftime("%d %b")
+    if from_email and _is_bounce(msg, from_email):
+        try:
+            dead = bool(DOMAIN_DEAD.search(msg.as_bytes().decode("utf-8", "ignore")))
+        except Exception:
+            dead = False
+        names = _mark_bounced(con, bounced_addresses(con, msg), day, domain_dead=dead)
+        return ("bounced", names) if names else None
     if not from_email or from_email == (own_address or "").lower() or _is_automatic(msg, from_email):
         return None
 
@@ -107,7 +177,6 @@ def handle_message(con, msg, own_address, today=None):
 
     subject = (msg.get("Subject") or "").strip()
     kind = classify(subject, fresh_text(msg))
-    day = (today or date.today()).strftime("%d %b")
     changed = []
     for lead in leads:
         if kind == "opted_out":
@@ -127,7 +196,7 @@ def check_replies(con, host, user, password, days=30, connect=None, on_event=Non
 
     connect: for tests, a function returning an IMAP-like object.
     """
-    counts = {"opted_out": 0, "interested": 0, "replied": 0}
+    counts = {"opted_out": 0, "interested": 0, "replied": 0, "bounced": 0}
     box = connect() if connect else imaplib.IMAP4_SSL(host, 993, timeout=30)
     try:
         box.login(user, password)
@@ -145,7 +214,8 @@ def check_replies(con, host, user, password, days=30, connect=None, on_event=Non
                 kind, names = result
                 counts[kind] += 1
                 if on_event:
-                    what = {"opted_out": "opted out", "interested": "said yes", "replied": "replied"}[kind]
+                    what = {"opted_out": "opted out", "interested": "said yes", "replied": "replied",
+                            "bounced": "bounced (bad email address)"}[kind]
                     on_event(f"{', '.join(names)} {what}.")
     finally:
         try:
